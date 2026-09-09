@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.app/
+desktop/reZme
+desktop/AppIcon.iconset/
+desktop/icon.png
+
+# Personal source material and generated reports (never publish).
+Archivo/
+Trasncrips/
+Instrucciones.rtf
+Rubin.png
+*.rtf
+reports/
+transcripts/
+*.log
+
+# Credentials and local settings.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.idea/
+.vscode/
