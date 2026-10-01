@@ -4,8 +4,8 @@ Una afirmación pasa a `verified` solo si:
   a) su cita aparece en el tramo, con coincidencia aproximada tras normalizar
      tildes, mayúsculas y puntuación, y
   b) su cifra (`metric_value`) se encuentra en el texto del tramo, aceptando
-     1,36 / 1.36 / 1 36, separadores de miles, escalas («45 mil millones») y
-     cifras dictadas sencillas («uno coma treinta y seis»).
+     1,36 / 1.36 / 1 36, separadores de miles, escalas («45 mil millones»,
+     «4 décimas») y cifras dictadas sencillas («uno coma treinta y seis»).
 Si no, queda `ungrounded` con el motivo en `attrs["grounding"]`.
 """
 from __future__ import annotations
@@ -129,8 +129,10 @@ _HUNDREDS = {
 _THOUSAND = {"mil", "thousand"}
 _JOINERS = {"y", "and"}
 _DECIMAL_WORDS = {"coma", "punto", "point", "con"}
-# «billón» (es) = 10^12; «billion» (en) = 10^9.
+# «billón» (es) = 10^12; «billion» (en) = 10^9. Las fracciones cubren «4 décimas» = 0,4.
 _SCALES = {
+    "decima": 0.1, "decimas": 0.1, "centesima": 0.01, "centesimas": 0.01,
+    "tenth": 0.1, "tenths": 0.1, "hundredth": 0.01, "hundredths": 0.01,
     "mil": 1e3, "miles": 1e3, "millon": 1e6, "millones": 1e6, "billon": 1e12,
     "billones": 1e12, "trillon": 1e18, "trillones": 1e18, "thousand": 1e3, "million": 1e6,
     "millions": 1e6, "billion": 1e9, "billions": 1e9, "trillion": 1e12, "trillions": 1e12,

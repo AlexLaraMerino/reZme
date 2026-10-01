@@ -398,6 +398,12 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
         run_id, stats = run["id"], run["stats"]
         stats.setdefault("tramos", {})
     result = ExtractResult(run_id, run is not None, label, chunks=len(chunks))
+    # El backend acumula consumo entre vídeos; a cada run se le apunta solo lo suyo.
+    base_cost, base_in, base_out = backend.cost_usd or 0.0, backend.input_tokens, backend.output_tokens
+    previous_cost = (run or {}).get("cost_usd") or 0.0
+    usage = stats.setdefault("consumo", {"entrada": 0, "salida": 0, "llamadas": 0,
+                                         "caracteres_prompt": 0, "caracteres_transcripcion": 0})
+    seen_in, seen_out = base_in, base_out
 
     failures = 0
     for chunk in chunks:
@@ -426,11 +432,19 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
             continue
         failures = 0
         result.llm_calls += calls
+        usage["entrada"] += backend.input_tokens - seen_in
+        usage["salida"] += backend.output_tokens - seen_out
+        seen_in, seen_out = backend.input_tokens, backend.output_tokens
+        usage["llamadas"] += calls
+        usage["caracteres_prompt"] += len(system) + len(user)
+        usage["caracteres_transcripcion"] += len(render(chunk))
         entry.update(estado="ok", reintento=calls > 1, descartes=parsed.errors,
                      campos_ignorados=parsed.ignored,
                      **_store_chunk(store, parsed, chunk, run_id, transcript["id"], result))
         stats["tramos"][str(chunk.index)] = entry
-        store.update_run(run_id, stats=stats, cost_usd=backend.cost_usd)
+        spent = (backend.cost_usd or 0.0) - base_cost
+        store.update_run(run_id, stats=stats,
+                         cost_usd=previous_cost + spent if backend.cost_usd is not None else None)
         result.chunks_processed += 1
 
     complete = all(stats["tramos"].get(str(c.index), {}).get("estado") == "ok" for c in chunks)

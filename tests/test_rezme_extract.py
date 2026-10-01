@@ -72,8 +72,23 @@ class ChunkingTests(unittest.TestCase):
     def cues(self, n=200, step=5.0):
         return [(i * step, f"frase {i}") for i in range(n)]  # 1000 s
 
+    OLD = dict(window_s=210, overlap_s=15, max_chapter_s=360)
+
+    def test_default_chunks_are_about_ten_minutes(self):
+        chunks = chunk_transcript(self.cues(n=400))  # 2000 s
+        self.assertEqual([(c.start, c.end) for c in chunks],
+                         [(0.0, 600.0), (580.0, 1180.0), (1160.0, 1760.0), (1740.0, 2005.0)])
+        self.assertEqual(len(chunk_transcript(self.cues())), 2)
+
+    def test_short_chapters_are_packed_together(self):
+        chapters = [{"start_time": i * 180, "title": f"C{i + 1}"} for i in range(6)]  # 6 × 3 min
+        chunks = chunk_transcript(self.cues(n=216), chapters, duration=1080)
+        self.assertEqual([(c.title, c.start, c.end) for c in chunks],
+                         [("C1 · C2 · C3", 0.0, 540.0), ("C4 · C5 · C6", 540.0, 1085.0)])
+        self.assertEqual(sum(len(c.cues) for c in chunks), 216)  # el corte cae entre capítulos
+
     def test_windows_keep_start_seconds_and_overlap(self):
-        chunks = chunk_transcript(self.cues())
+        chunks = chunk_transcript(self.cues(), **self.OLD)
         self.assertEqual([(c.start, c.end) for c in chunks],
                          [(0.0, 210.0), (195.0, 405.0), (390.0, 600.0), (585.0, 795.0),
                           (780.0, 1005.0)])
@@ -89,17 +104,16 @@ class ChunkingTests(unittest.TestCase):
     def test_chapters_define_chunks_and_long_ones_are_split(self):
         chapters = [{"start_time": 30, "title": "Intro"}, {"start_time": 200, "title": "Tesis"},
                     {"start_time": 500, "title": "Cierre"}]
-        chunks = chunk_transcript(self.cues(), chapters, duration=1000)
+        chunks = chunk_transcript(self.cues(), chapters, duration=1000, **self.OLD)
         self.assertEqual([(c.title, c.start, c.end) for c in chunks], [
-            (None, 0.0, 30.0),            # texto anterior al primer capítulo
-            ("Intro", 30.0, 200.0),
+            ("Intro", 0.0, 200.0),        # incluye el texto anterior al primer capítulo
             ("Tesis", 200.0, 500.0),      # 5 min: cabe entero
             ("Cierre", 500.0, 710.0),     # 505 s: se parte en ventanas
             ("Cierre", 695.0, 905.0),
             ("Cierre", 890.0, 1005.0),
         ])
-        self.assertEqual(chunks[1].cues[0][0], 30.0)
-        self.assertEqual(chunks[1].cues[-1][0], 195.0)
+        self.assertEqual(chunks[0].cues[0][0], 0.0)
+        self.assertEqual(chunks[0].cues[-1][0], 195.0)
 
     def test_short_video_and_empty_input(self):
         chunks = chunk_transcript(CUES)
@@ -109,7 +123,7 @@ class ChunkingTests(unittest.TestCase):
         self.assertTrue(render(chunks[0]).startswith("[00:00:00] Hola a todos"))
 
     def test_broken_chapters_fall_back_to_windows(self):
-        chunks = chunk_transcript(self.cues(), [{"title": "sin inicio"}])
+        chunks = chunk_transcript(self.cues(), [{"title": "sin inicio"}], **self.OLD)
         self.assertEqual(len(chunks), 5)
 
 
@@ -163,11 +177,14 @@ class VerifyTests(unittest.TestCase):
             "244 000 millones": 244000, "1.234,56 euros": 1234.56, "1,000,000 users": 1e6,
             "doscientos cuarenta y ocho satélites": 248, "dos mil quinientos": 2500,
             "el 0,002% del tráfico": 0.002, "cae un -3 por ciento": -3, "un millón": 1e6,
+            "habíamos bajado una décima": 0.1, "aproximadamente 4 décimas de distancia": 0.4,
+            "sube dos décimas": 0.2, "tres centésimas": 0.03, "fell by two tenths": 0.2,
         }
         for text, value in cases.items():
             self.assertTrue(vf.number_in_text(value, text), text)
         for text, value in {"sale 1,36": 1.4, "sale 1,36": 136, "una empresa grande": 1,
-                            "el 15 %": 0.15, "dos tres": 23}.items():
+                            "el 15 %": 0.15, "dos tres": 23, "la décima vez": 0.1,
+                            "4 décimas": 4.5}.items():
             self.assertFalse(vf.number_in_text(value, text), text)
 
 
@@ -429,7 +446,7 @@ class ExtractTests(ExtractBase):
             self.run_with(response(), domain="astrología")
 
     def test_backend_failure_is_recorded_and_resumable(self):
-        cues = [(i * 5.0, f"frase número {i} del vídeo de prueba") for i in range(100)]  # 3 tramos
+        cues = [(i * 20.0, f"frase número {i} del vídeo de prueba") for i in range(80)]  # 3 tramos
         self.store.save_transcript(self.src, cues, "whisper")
         ok = response()
         result, llm = self.run_with(ok, RuntimeError("claude falló (1)"), ok)
@@ -440,9 +457,30 @@ class ExtractTests(ExtractBase):
                          (result.run_id, 2, 1))
         self.assertEqual(len(llm2.calls), 1)
 
-        self.store.save_transcript(self.src, cues + [(600.0, "fin")], "whisper")
+        self.store.save_transcript(self.src, cues + [(1700.0, "fin")], "whisper")
         with self.assertRaisesRegex(ex.ExtractionError, "reanudarla"):
             self.run_with(RuntimeError("sin red"))
+
+    def test_usage_and_cost_are_recorded_per_run_not_cumulative(self):
+        llm = FakeLLM(response(claim_json()))
+        backend = llm.backend()
+
+        def metered(system, user):
+            backend.input_tokens += 1000
+            backend.output_tokens += 200
+            backend.cost_usd = (backend.cost_usd or 0.0) + 0.05
+            return llm(system, user)
+        backend.call = metered
+        first = ex.extract_source(self.store, self.src, backend)
+        other, _ = self.store.add_source("youtube", "JXiQ6Tk_P84", title="Otro")
+        self.store.save_transcript(other, CUES, "subtitles_auto")
+        second = ex.extract_source(self.store, other, backend)
+        for run_id in (first.run_id, second.run_id):
+            run = self.store.get_run(run_id)
+            self.assertAlmostEqual(run["cost_usd"], 0.05)
+            usage = run["stats"]["consumo"]
+            self.assertEqual((usage["entrada"], usage["salida"], usage["llamadas"]), (1000, 200, 1))
+            self.assertGreater(usage["caracteres_prompt"], usage["caracteres_transcripcion"])
 
     def test_missing_source_or_transcript(self):
         with self.assertRaisesRegex(ValueError, "no existe"):

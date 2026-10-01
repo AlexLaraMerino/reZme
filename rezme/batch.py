@@ -349,11 +349,14 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
               langs: Sequence[str] = ("es", "en"), whisper_model: str = "small",
               cookies_from: str | None = None, deps: Deps | None = None,
               out: Callable[[str], None] = print,
-              on_change: Callable[[], None] | None = None) -> RunSummary:
+              on_change: Callable[[], None] | None = None,
+              only: Iterable[int] | None = None) -> RunSummary:
     """Procesa la cola. Un fallo en un vídeo nunca detiene el lote.
 
     `on_change` se llama cuando un trabajo empieza o termina (para refrescar una interfaz).
+    `only` limita la pasada a esos ids de trabajo.
     """
+    chosen = None if only is None else set(only)
     changed = on_change or (lambda: None)
     if stage not in STAGES:
         raise ValueError(f"Etapa no válida: {stage!r} (permitidas: {', '.join(STAGES)}).")
@@ -365,7 +368,8 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
     def candidates() -> list[dict[str, Any]]:
         if whisper_only:
             return store.pending_jobs(stages=("ingest",), status="skipped", notes=NO_SUBS_NOTE)
-        return store.pending_jobs(stages=STAGES[stage])
+        jobs = store.pending_jobs(stages=STAGES[stage])
+        return jobs if chosen is None else [j for j in jobs if j["id"] in chosen]
 
     total = len(candidates())
     if limit is not None:

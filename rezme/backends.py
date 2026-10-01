@@ -32,6 +32,10 @@ class BackendUnavailable(RuntimeError):
     """El modelo no se puede usar (credenciales, saldo, modelo inexistente): no tiene sentido seguir."""
 
 
+class BudgetExceeded(BackendUnavailable):
+    """Se ha alcanzado el tope de gasto fijado para esta tanda."""
+
+
 _ACCESS_HINTS = ("log in", "login", "authenticat", "api key", "credit", "usage limit",
                  "invalid x-api-key", "unauthorized")
 
@@ -47,6 +51,8 @@ class Backend:
     model: str | None
     call: LLMCall
     cost_usd: float | None = None  # acumulado, si el backend lo informa
+    input_tokens: int = 0          # acumulados, si el backend los cuenta
+    output_tokens: int = 0
 
 
 @contextmanager
