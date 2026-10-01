@@ -9,6 +9,8 @@ resources = contents / 'Resources'
 subprocess.run(['xcrun', 'swiftc', str(root/'desktop/ReZme.swift'), '-o', str(contents/'MacOS/reZme'), '-target', f'{platform.machine()}-apple-macos14.0', '-framework', 'SwiftUI', '-framework', 'AppKit', '-parse-as-library'], check=True)
 for name, source in [('worker.py', root/'desktop/worker.py'), ('yt_digest.py', root/'yt_digest.py')]:
     shutil.copy2(source, resources/name)
+shutil.rmtree(resources/'rezme', ignore_errors=True)
+shutil.copytree(root/'rezme', resources/'rezme', ignore=shutil.ignore_patterns('__pycache__'))
 (resources/'runtime.txt').unlink(missing_ok=True)  # Remove legacy machine-specific configuration.
 iconset = root/'desktop/AppIcon.iconset'
 iconset.mkdir(exist_ok=True)

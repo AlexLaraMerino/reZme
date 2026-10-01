@@ -96,9 +96,87 @@ def run(options):
     emit("result", text=body, title=meta["title"])
 
 
+def _job_view(job):
+    status, stage = job["status"], job["stage"]
+    if status == "pending":
+        state, detail = ("saved", "Transcripción guardada") if stage == "extract" else ("pending", "En cola")
+    elif status == "running":
+        state, detail = "running", "Procesando…"
+    elif status == "done":
+        state, detail = "saved", "Transcripción y extracción guardadas"
+    elif status == "failed":
+        state, detail = "failed", job["last_error"] or "No se pudo procesar."
+    else:
+        state, detail = "skipped", job["notes"] or "Saltado"
+    return {"id": job["id"], "title": job["title"] or job["video_id"], "state": state, "detail": detail}
+
+
+def emit_queue(store):
+    jobs = [_job_view(job) for job in store.list_jobs()]
+    count = lambda state: sum(1 for job in jobs if job["state"] == state)
+    summary = (f"{count('saved')} guardados · {count('pending') + count('running')} en cola · "
+               f"{count('failed')} fallidos · {count('skipped')} sin subtítulos") if jobs else ""
+    emit("queue", jobs=jobs, summary=summary)
+
+
+def run_queue(options):
+    """Cola de lotes para la app: añade URLs o listas y guarda las transcripciones una a una."""
+    from rezme import Store, batch
+
+    action = options.get("action", "status")
+    if action not in ("status", "run", "retry", "clear"):
+        raise ValueError("Acción de cola no válida.")
+    if not options.get("db"):
+        raise ValueError("No se encuentra la base de datos de reZme.")
+    cookies = options.get("browser") or None
+    whisper = bool(options.get("whisper"))
+    with Store(options["db"]) as store:
+        if action == "retry":
+            store.retry_jobs(status="failed")
+            store.retry_jobs(status="skipped")
+        elif action == "clear":
+            for job in store.list_jobs():
+                if job["status"] == "done" or (job["status"] == "pending" and job["stage"] == "extract"):
+                    store.remove_job(job["id"])
+        elif action == "run":
+            urls = batch.read_urls(options.get("urls", "").splitlines())
+            if urls:
+                emit("progress", message="Leyendo los vídeos de la lista…")
+                # En la app, una URL con `list=` significa la lista entera.
+                report = batch.add_urls(store, urls, whole_playlist=True, cookies_from=cookies)
+                if report.invalid and not (report.added or report.already):
+                    raise ValueError("Introduce una URL válida de YouTube (vídeo o lista).")
+                message = f"{report.added} vídeos añadidos · {report.already} ya estaban"
+                if report.inaccessible:
+                    message += f" · {len(report.inaccessible)} no accesibles"
+                emit("progress", message=message)
+            if whisper:  # con Whisper activado, se recuperan los que quedaron sin subtítulos
+                store.retry_jobs(status="skipped")
+            store.recover_running_jobs()
+            emit_queue(store)
+            summary = batch.run_queue(
+                store, no_whisper=not whisper, cookies_from=cookies,
+                out=lambda message: emit("progress", message=message),
+                on_change=lambda: emit_queue(store))
+            emit_queue(store)
+            emit("done", message=batch.format_summary(summary))
+            return
+        emit_queue(store)
+
+
+def _terminate(*_):
+    raise KeyboardInterrupt  # Cancelar desde la app: la cola deja el vídeo en curso limpio.
+
+
 if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGTERM, _terminate)
     try:
-        run(json.load(sys.stdin))
+        options = json.load(sys.stdin)
+        if options.get("mode") == "queue":
+            run_queue(options)
+        else:
+            run(options)
     except Exception as error:
         # Network/extractor exceptions may contain URLs; never include request headers or keys.
         message = str(error)

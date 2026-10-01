@@ -336,8 +336,13 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
               stage: str = "ingest", no_whisper: bool = False, whisper_only: bool = False,
               langs: Sequence[str] = ("es", "en"), whisper_model: str = "small",
               cookies_from: str | None = None, deps: Deps | None = None,
-              out: Callable[[str], None] = print) -> RunSummary:
-    """Procesa la cola. Un fallo en un vídeo nunca detiene el lote."""
+              out: Callable[[str], None] = print,
+              on_change: Callable[[], None] | None = None) -> RunSummary:
+    """Procesa la cola. Un fallo en un vídeo nunca detiene el lote.
+
+    `on_change` se llama cuando un trabajo empieza o termina (para refrescar una interfaz).
+    """
+    changed = on_change or (lambda: None)
     if stage not in ("ingest", "all"):
         raise ValueError(f"Etapa no válida: {stage!r} (permitidas: ingest, all).")
     deps = deps or Deps()
@@ -366,6 +371,7 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
             position += 1
             tag = f"[{position}/{total}]"
             store.update_job(job["id"], status="running", started_at=utc_now(), last_error=None)
+            changed()
             network = True
             tries = 0
             while True:
@@ -419,6 +425,7 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
                     out(f"{tag} {name} · " + " · ".join(parts))
                     break
 
+            changed()
             if len(blocked_streak) >= MAX_BLOCKED_STREAK:
                 for job_id in blocked_streak:  # no fue culpa de esos vídeos
                     store.retry_jobs(job_id=job_id)

@@ -62,6 +62,62 @@ class DesktopTests(unittest.TestCase):
                 worker.call_meta("prompt", "test", "muse-spark-1.3")
         self.assertEqual(request.call_args.args[0].full_url, "https://api.meta.ai/v1/chat/completions")
 
+    def queue(self, db, **options):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            worker.run_queue(dict(mode="queue", db=db, **options))
+        return [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_queue_adds_playlist_and_saves_transcripts(self):
+        import os, tempfile
+        from rezme import Store, batch
+        ids = ["aaaaaaaaaa1", "bbbbbbbbbb2", "cccccccccc3"]
+        entries = [batch.PlaylistEntry(ids[0], "Uno"), batch.PlaylistEntry(ids[1], "Dos"),
+                   batch.PlaylistEntry(ids[2], "Tres"), batch.PlaylistEntry(None, "[Private video]", "vídeo privado")]
+        def fetch(url, langs, tmp, cookies):
+            video = url.split("v=")[1]
+            if video == ids[1]:
+                raise RuntimeError("Private video")
+            subs = {} if video == ids[2] else {"automatic_captions": {"es": [{"ext": "json3", "url": "u"}]}}
+            return dict(title=f"Vídeo {video[0]}", **subs), ([] if video == ids[2] else [(0, "hola")])
+        deps = batch.Deps(fetch=fetch, transcribe=lambda *a: self.fail("Whisper desactivado"),
+                          sleep=lambda s: None, clock=lambda: 0.0, uniform=lambda a, b: 0.0)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(batch, "expand_playlist", return_value=entries), \
+                patch.object(batch, "Deps", lambda: deps):
+            db = os.path.join(tmp, "data", "rezme.db")
+            events = self.queue(db, action="run", browser="chrome",
+                                urls="https://www.youtube.com/watch?v=aaaaaaaaaa1&list=PLabcdefghij0123456789")
+            self.assertIn("3 vídeos añadidos · 0 ya estaban · 1 no accesibles", [e.get("message") for e in events])
+            self.assertTrue(any(j["state"] == "running" for e in events if e["type"] == "queue" for j in e["jobs"]))
+            final = [e for e in events if e["type"] == "queue"][-1]
+            self.assertEqual([(j["title"], j["state"]) for j in final["jobs"]],
+                             [("Vídeo a", "saved"), ("Dos", "failed"), ("Tres", "skipped")])
+            self.assertEqual(final["jobs"][1]["detail"], "vídeo privado")
+            self.assertEqual(final["summary"], "1 guardados · 0 en cola · 1 fallidos · 1 sin subtítulos")
+            self.assertEqual(events[-1]["type"], "done")
+            self.assertNotIn("chrome", json.dumps(events))
+            with Store(db) as store:
+                self.assertEqual(store.stats()["transcripts"], 1)
+
+            retried = self.queue(db, action="retry")[-1]
+            self.assertEqual([j["state"] for j in retried["jobs"]], ["saved", "pending", "pending"])
+            cleared = self.queue(db, action="clear")[-1]
+            self.assertEqual(len(cleared["jobs"]), 2)
+            with Store(db) as store:
+                self.assertEqual(store.stats()["transcripts"], 1)  # limpiar la cola no borra lo guardado
+
+    def test_queue_status_empty_and_bad_input(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "rezme.db")
+            self.assertEqual(self.queue(db, action="status"), [{"type": "queue", "jobs": [], "summary": ""}])
+            with self.assertRaisesRegex(ValueError, "URL válida"):
+                self.queue(db, action="run", urls="https://example.com/x")
+            with self.assertRaises(ValueError):
+                self.queue(db, action="borrar")
+        with self.assertRaises(ValueError):
+            self.queue("", action="status")
+
 
 if __name__ == "__main__":
     unittest.main()

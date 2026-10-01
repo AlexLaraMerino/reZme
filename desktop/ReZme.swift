@@ -31,8 +31,19 @@ enum KeyStore {
     static func delete() { SecItemDelete(query as CFDictionary) }
 }
 
+struct QueueJob: Identifiable {
+    let id: Int
+    let title: String
+    let state: String
+    let detail: String
+}
+
 @MainActor
 final class AppModel: ObservableObject {
+    @Published var queueText = ""
+    @Published var whisper = false
+    @Published var jobs: [QueueJob] = []
+    @Published var queueSummary = ""
     @Published var url = ""
     @Published var mode = "prompt"
     @Published var key = ""
@@ -142,9 +153,78 @@ final class AppModel: ObservableObject {
             }
         }
     }
+    /// Cola de vídeos: `run` añade las URLs y procesa; `status`, `retry` y `clear` la gestionan.
+    func queue(_ action: String) {
+        guard !busy else { return }
+        error = false
+        let root = Bundle.main.bundleURL.resolvingSymlinksInPath().deletingLastPathComponent()
+        let runtime = root.appendingPathComponent(".venv/bin/python")
+        guard let resources = Bundle.main.resourceURL, FileManager.default.isExecutableFile(atPath: runtime.path) else {
+            status = "Falta el entorno de Python. Ejecuta Instalar.command desde la carpeta del proyecto."; error = true; return
+        }
+        let task = Process()
+        task.executableURL = runtime
+        task.arguments = [resources.appendingPathComponent("worker.py").path]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PYTHONUNBUFFERED"] = "1"
+        task.environment = env
+        let input = Pipe(), result = Pipe()
+        task.standardInput = input; task.standardOutput = result
+        task.standardError = FileHandle.nullDevice
+        let payload: [String: String] = [
+            "mode": "queue", "action": action, "urls": queueText, "browser": browser,
+            "whisper": whisper ? "1" : "", "db": root.appendingPathComponent("rezme_data/rezme.db").path]
+        let id = UUID(); generation = id
+        do {
+            try task.run()
+            process = task; busy = true
+            if action == "run" { status = "Preparando la cola…" }
+            try input.fileHandleForWriting.write(contentsOf: JSONSerialization.data(withJSONObject: payload))
+            try input.fileHandleForWriting.close()
+        } catch {
+            task.terminate(); busy = false; self.error = true
+            status = "No se pudo iniciar la cola: \(error.localizedDescription)"; return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var pending = Data()
+            while true {
+                let data = result.fileHandleForReading.availableData
+                if data.isEmpty { break }
+                pending.append(data)
+                while let end = pending.firstIndex(of: 10) {
+                    let line = Data(pending[..<end]); pending.removeSubrange(...end)
+                    guard let event = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                    DispatchQueue.main.async {
+                        guard self.generation == id else { return }
+                        switch event["type"] as? String {
+                        case "progress", "done": self.status = event["message"] as? String ?? ""
+                        case "queue":
+                            self.queueSummary = event["summary"] as? String ?? ""
+                            self.jobs = (event["jobs"] as? [[String: Any]] ?? []).compactMap { job in
+                                guard let jobID = job["id"] as? Int else { return nil }
+                                return QueueJob(id: jobID, title: job["title"] as? String ?? "", state: job["state"] as? String ?? "", detail: job["detail"] as? String ?? "")
+                            }
+                        case "error": self.error = true; self.status = event["message"] as? String ?? "No se pudo procesar la cola."
+                        default: break
+                        }
+                    }
+                }
+            }
+            task.waitUntilExit()
+            DispatchQueue.main.async {
+                guard self.generation == id else { return }
+                self.busy = false; self.process = nil
+                if task.terminationStatus != 0 && !self.error {
+                    self.error = true; self.status = "El proceso se ha interrumpido. Puedes volver a lanzarlo: continuará donde lo dejó."
+                } else if action == "run" && !self.error { self.queueText = "" }
+            }
+        }
+    }
     func cancel() {
         generation = UUID(); process?.terminate(); process = nil; busy = false
-        status = "Análisis cancelado."; error = false
+        status = mode == "queue" ? "Cola en pausa. Lo ya guardado se conserva." : "Análisis cancelado."; error = false
+        if mode == "queue" { DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.queue("status") } }
     }
     func copy() {
         NSPasteboard.general.clearContents()
@@ -176,13 +256,21 @@ struct ContentView: View {
                 Text("Menos vídeo. Más ideas.").font(.subheadline).foregroundStyle(.secondary)
                 Divider()
                 VStack(alignment: .leading, spacing: 9) {
-                    Text("01  EL VÍDEO").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    TextField("Pega una URL de YouTube", text: $app.url).textFieldStyle(.roundedBorder)
+                    if app.mode == "queue" {
+                        Text("01  LOS VÍDEOS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        TextEditor(text: $app.queueText).font(.system(size: 11)).frame(height: 70)
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(.quaternary))
+                        Text("Pega la URL de una lista de reproducción o varias URLs, una por línea.").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("01  EL VÍDEO").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        TextField("Pega una URL de YouTube", text: $app.url).textFieldStyle(.roundedBorder)
+                    }
                 }
                 VStack(alignment: .leading, spacing: 10) {
                     Text("02  ELIGE EL RESULTADO").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     modeButton("prompt", "Preparar prompt", "Para copiarlo a tu IA favorita", "doc.on.clipboard")
                     modeButton("api", "Generar informe", "Directamente con Muse Spark", "sparkles")
+                    modeButton("queue", "Procesar lista", "Guarda cada transcripción en tu base", "list.bullet.rectangle")
                 }
                 DisclosureGroup("Opciones", isExpanded: $app.options) {
                     VStack(alignment: .leading, spacing: 10) {
@@ -202,17 +290,22 @@ struct ContentView: View {
                             Text("Safari").tag("safari")
                         }
                         Text("Opcional: usa la sesión de tu navegador si YouTube pide iniciar sesión.").font(.caption).foregroundStyle(.secondary)
-                        Text("O pega una transcripción").font(.caption.weight(.medium))
-                        TextEditor(text: $app.transcript).font(.system(size: 11)).frame(height: 85)
-                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(.quaternary))
+                        if app.mode == "queue" {
+                            Toggle("Transcribir con Whisper los vídeos sin subtítulos", isOn: $app.whisper).font(.caption)
+                            Text("Con vídeos largos puede tardar horas. Si lo dejas desactivado, esos vídeos quedan marcados para después.").font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("O pega una transcripción").font(.caption.weight(.medium))
+                            TextEditor(text: $app.transcript).font(.system(size: 11)).frame(height: 85)
+                                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.quaternary))
+                        }
                     }.padding(.top, 10)
                 }
                 Spacer(minLength: 0)
                 if app.busy {
                     HStack { ProgressView().controlSize(.small); Text("Trabajando…").font(.subheadline); Spacer(); Button("Cancelar", action: app.cancel) }
                 } else {
-                    Button(action: app.start) {
-                        HStack { Text(app.mode == "prompt" ? "Preparar prompt" : "Generar informe"); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 7)
+                    Button { if app.mode == "queue" { app.queue("run") } else { app.start() } } label: {
+                        HStack { Text(app.mode == "queue" ? "Añadir y procesar" : app.mode == "prompt" ? "Preparar prompt" : "Generar informe"); Spacer(); Image(systemName: "arrow.right") }.padding(.vertical, 7)
                     }.buttonStyle(.borderedProminent).tint(accent).keyboardShortcut(.return, modifiers: .command)
                 }
                 Text("En tu Mac · Sin cuentas ni suscripciones\nEl modo API consume tu saldo de Meta.")
@@ -221,6 +314,7 @@ struct ContentView: View {
             }.frame(width: 315).background(Color(nsColor: .controlBackgroundColor))
             Divider()
             VStack(alignment: .leading, spacing: 18) {
+                if app.mode == "queue" { queuePanel } else {
                 HStack {
                     Text(app.output.isEmpty ? "TU ESPACIO DE LECTURA" : "RESULTADO").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Spacer()
@@ -240,6 +334,7 @@ struct ContentView: View {
                     Text(app.title).font(.title2.weight(.semibold)).lineLimit(2)
                     TextEditor(text: $app.output).font(.system(size: 14, design: .monospaced)).lineSpacing(5)
                 }
+                }
                 if !app.status.isEmpty {
                     HStack(alignment: .top) {
                         Image(systemName: app.error ? "exclamationmark.circle" : "info.circle")
@@ -252,8 +347,45 @@ struct ContentView: View {
         }.frame(minWidth: 950, minHeight: 700)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in app.cancel() }
     }
+    @ViewBuilder var queuePanel: some View {
+        HStack {
+            Text("COLA DE VÍDEOS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Spacer()
+            Button { app.queue("retry") } label: { Label("Reintentar", systemImage: "arrow.clockwise") }
+                .disabled(app.busy || !app.jobs.contains { $0.state == "failed" || $0.state == "skipped" })
+            Button { app.queue("clear") } label: { Label("Quitar guardados", systemImage: "checkmark.circle") }
+                .disabled(app.busy || !app.jobs.contains { $0.state == "saved" })
+        }
+        if app.jobs.isEmpty {
+            Spacer()
+            Image(systemName: "list.bullet.rectangle").font(.system(size: 42, weight: .light)).foregroundStyle(accent)
+            Text("Tu lista,\nvídeo a vídeo.").font(.system(size: 37, weight: .semibold, design: .serif))
+            Text("Pega una lista de reproducción y reZme guardará\nla transcripción de cada vídeo en tu base de conocimiento.")
+                .font(.system(size: 15)).foregroundStyle(.secondary).lineSpacing(5)
+            Spacer()
+        } else {
+            Text(app.queueSummary).font(.title3.weight(.semibold))
+            List(app.jobs) { job in
+                HStack(alignment: .top, spacing: 10) {
+                    Group {
+                        switch job.state {
+                        case "saved": Image(systemName: "checkmark.circle.fill").foregroundStyle(accent)
+                        case "running": ProgressView().controlSize(.small)
+                        case "failed": Image(systemName: "xmark.circle.fill").foregroundStyle(Color.red)
+                        case "skipped": Image(systemName: "forward.circle").foregroundStyle(Color.orange)
+                        default: Image(systemName: "circle").foregroundStyle(Color.secondary)
+                        }
+                    }.frame(width: 18)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(job.title).lineLimit(1)
+                        Text(job.detail).font(.caption).foregroundStyle(job.state == "failed" ? Color.red : Color.secondary)
+                    }
+                }.padding(.vertical, 2)
+            }.listStyle(.plain)
+        }
+    }
     func modeButton(_ value: String, _ title: String, _ subtitle: String, _ icon: String) -> some View {
-        Button { app.mode = value; if value == "api" { app.loadKey() } } label: {
+        Button { app.mode = value; if value == "api" { app.loadKey() }; if value == "queue" { app.queue("status") } } label: {
             HStack(spacing: 12) {
                 Image(systemName: icon).font(.title3).frame(width: 23)
                 VStack(alignment: .leading, spacing: 4) { Text(title).font(.system(size: 14, weight: .semibold)); Text(subtitle).font(.caption).foregroundStyle(.secondary) }
