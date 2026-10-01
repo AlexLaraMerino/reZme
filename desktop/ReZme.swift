@@ -198,6 +198,26 @@ final class AppModel: ObservableObject {
         if hasPrices { text += " · ≈ \(money(items.reduce(0) { $0 + cost($1) }))" }
         return text
     }
+    /// Texto de la confirmación previa a extraer. Se monta por partes: una sola expresión larga
+    /// de cadenas concatenadas agota el comprobador de tipos en compiladores anteriores.
+    var confirmMessage: String {
+        var text = ""
+        if pilot, let first = batchToRun.first { text += "«\(first.title)»: " }
+        text += summary(batchToRun) + ". "
+        if !calibrated { text += "Es una estimación sin calibrar. " }
+        text += "La extracción se detendrá sola al llegar a \(money(budgetValue)). "
+        text += engine == "meta" ? "El consumo se factura en tu cuenta de Meta." : "Se usa tu suscripción de Claude Code."
+        text += " Puedes pausar cuando quieras: continuará donde lo dejó."
+        return text
+    }
+    /// Etiqueta de la fila de un vídeo: coste estimado si falta extraer, o sus afirmaciones.
+    func badge(_ source: LibrarySource) -> String {
+        if source.job != nil {
+            let calls = "\(source.calls) llamadas"
+            return hasPrices ? "≈ \(money(cost(source))) · " + calls : calls
+        }
+        return source.verified > 0 ? "\(source.verified) afirmaciones" : "Sin afirmaciones"
+    }
     func toggle(_ source: LibrarySource) {
         guard let job = source.job else { return }
         if excluded.contains(job) { excluded.remove(job) } else { excluded.insert(job) }
@@ -915,8 +935,7 @@ struct ContentView: View {
                                 Spacer()
                             }.contentShape(Rectangle())
                         }.buttonStyle(.plain).help("Ver las afirmaciones de este vídeo")
-                        Text(source.job != nil ? (app.hasPrices ? "≈ \(app.money(app.cost(source))) · " : "") + "\(source.calls) llamadas"
-                             : source.verified > 0 ? "\(source.verified) afirmaciones" : "Sin afirmaciones")
+                        Text(app.badge(source))
                             .font(.caption).foregroundStyle(source.verified > 0 ? accent : Color.secondary)
                             .padding(.horizontal, 8).padding(.vertical, 3)
                             .background((source.verified > 0 ? accent : Color.gray).opacity(0.12), in: Capsule())
@@ -935,11 +954,7 @@ struct ContentView: View {
             Button("Extraer con \(app.engineName)") { app.extract() }
             Button("Cancelar", role: .cancel) {}
         } message: {
-            Text((app.pilot ? "«\(app.batchToRun.first?.title ?? "")»: " : "") + app.summary(app.batchToRun) + ". "
-                 + (app.calibrated ? "" : "Es una estimación sin calibrar. ")
-                 + "La extracción se detendrá sola al llegar a \(app.money(app.budgetValue)). "
-                 + (app.engine == "meta" ? "El consumo se factura en tu cuenta de Meta." : "Se usa tu suscripción de Claude Code.")
-                 + " Puedes pausar cuando quieras: continuará donde lo dejó.")
+            Text(app.confirmMessage)
         }
     }
 
