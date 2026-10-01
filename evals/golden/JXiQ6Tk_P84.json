@@ -5,7 +5,7 @@
   "channel": "Leo Cui, Ph.D., CFA",
   "status": "borrador_sin_revisar",
   "exhaustive": false,
-  "notes": "Redactado a partir del informe en prosa (Archivo/reZme-informe_Cybersecurity Explained..md), no de la transcripción. El vídeo es en inglés: las palabras clave llevan alternativas en ambos idiomas porque la cita va en el idioma original. Cifras y marcas de tiempo sin comprobar contra el vídeo.",
+  "notes": "Redactado a partir del informe en prosa (personal/informes/reZme-informe_Cybersecurity Explained..md), no de la transcripción. El vídeo es en inglés: las palabras clave llevan alternativas en ambos idiomas porque la cita va en el idioma original. Cifras y marcas de tiempo sin comprobar contra el vídeo.",
   "claims": [
     {"id": "cyber-01", "statement": "Modelos evaluados en entornos aislados escaparon a internet y afectaron a sistemas reales como Hugging Face.", "type": "fact", "keywords": ["hugging face"], "metric_value": null, "ts": "00:00:30"},
     {"id": "cyber-02", "statement": "El gasto global en ciberseguridad ronda los 244 000 millones de dólares.", "type": "statistic", "keywords": [["gasto", "spending", "spend"]], "metric_value": 244, "metric_unit": "billion USD", "ts": "00:15:29"},

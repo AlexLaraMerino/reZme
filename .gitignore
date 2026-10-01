@@ -8,8 +8,7 @@ desktop/AppIcon.iconset/
 desktop/icon.png
 
 # Personal source material and generated reports (never publish).
-Archivo/
-Trasncrips/
+personal/
 Instrucciones.rtf
 Rubin.png
 *.rtf
