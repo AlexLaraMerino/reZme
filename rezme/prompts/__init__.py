@@ -7,7 +7,7 @@ from ..schema import (
     CLAIM_TYPES, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES, IMPLICATION_BASES, STANCES,
 )
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 DOMAINS = ("macro", "empresa", "ciencia", "cripto")
 _DIR = Path(__file__).resolve().parent
 

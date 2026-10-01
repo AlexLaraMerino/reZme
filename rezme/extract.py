@@ -70,6 +70,7 @@ class Parsed:
     errors: list[str] = field(default_factory=list)
     ignored: list[str] = field(default_factory=list)
     fatal: bool = False  # la respuesta entera es inservible
+    truncated: bool = False  # respuesta cortada: solo se han rescatado las afirmaciones completas
 
 
 @dataclass
@@ -111,6 +112,50 @@ def parse_json(text: str) -> Any:
         except json.JSONDecodeError as exc:
             raise ValidationError(f"la respuesta no es JSON válido ({exc.msg}, línea "
                                   f"{exc.lineno})") from None
+
+
+def _complete_objects(text: str, start: int) -> list[Any]:
+    """Objetos JSON completos de una lista que empieza en `text[start] == '['`, aunque esté cortada."""
+    items: list[Any] = []
+    depth, begin, in_string, escaped = 0, -1, False, False
+    for i in range(start + 1, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                begin = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                try:
+                    items.append(json.loads(text[begin:i + 1]))
+                except json.JSONDecodeError:
+                    pass
+        elif ch == "]" and depth == 0:
+            break
+    return items
+
+
+def salvage_truncated(text: str) -> dict[str, Any] | None:
+    """Si la respuesta se cortó a mitad (límite de longitud), rescata las afirmaciones completas."""
+    body = text.strip().rstrip("`").rstrip()
+    if body.endswith("}"):
+        return None  # no está cortada: que la valide el camino normal
+    lists: dict[str, list[Any]] = {}
+    for key in ("entities", "claims"):
+        match = re.search(rf'"{key}"\s*:\s*\[', body)
+        lists[key] = _complete_objects(body, match.end() - 1) if match else []
+    return lists if lists["claims"] else None
 
 
 def _text(item: dict[str, Any], key: str, *, numbers: bool = False) -> str | None:
@@ -238,7 +283,13 @@ def parse_response(text: str, source_id: int) -> Parsed:
     """Valida la respuesta. Los elementos no válidos se quedan fuera y en `errors`."""
     parsed = Parsed()
     try:
-        data = parse_json(text)
+        try:
+            data = parse_json(text)
+        except ValidationError:
+            data = salvage_truncated(text)
+            if data is None:
+                raise
+            parsed.truncated = True
         if not isinstance(data, dict):
             raise ValidationError("la respuesta debe ser un objeto JSON")
         if not isinstance(data.get("claims"), list):
@@ -438,6 +489,8 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
         usage["llamadas"] += calls
         usage["caracteres_prompt"] += len(system) + len(user)
         usage["caracteres_transcripcion"] += len(render(chunk))
+        if parsed.truncated:
+            entry["truncada"] = True
         entry.update(estado="ok", reintento=calls > 1, descartes=parsed.errors,
                      campos_ignorados=parsed.ignored,
                      **_store_chunk(store, parsed, chunk, run_id, transcript["id"], result))

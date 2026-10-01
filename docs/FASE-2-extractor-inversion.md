@@ -201,4 +201,12 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   afirmaciones por tramo. Cada run guarda su consumo (`stats.consumo` y
   `cost_usd`). La app estima el coste por vídeo, calibra la estimación con el
   consumo real de los runs anteriores y aplica un tope de gasto por tanda.
+- Prompt v2: salida compacta (solo `statement`, `type` y `quote` son
+  obligatorios; no se escriben campos vacíos), porque con v1 las respuestas se
+  cortaban por longitud. Si aun así una respuesta llega cortada, se rescatan las
+  afirmaciones completas y el tramo queda marcado `truncada`.
+- Límites de Meta: ante un 429 se espera lo que indique `Retry-After` (o 20, 40,
+  80, 160 y 300 s) y se reintenta; la pausa entre llamadas crece con cada 429 y
+  se relaja después. Solo se detiene el lote si Meta sigue limitando tras todas
+  las esperas, o si el 429 es por saldo o cuota agotados.
 

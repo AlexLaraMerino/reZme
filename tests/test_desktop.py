@@ -138,10 +138,10 @@ class DesktopTests(unittest.TestCase):
             self.assertGreater(first["tokens_in"], 2000)  # las instrucciones pesan más que el texto
             self.assertGreater(first["tokens_out"], 0)
 
-            with patch.object(worker, "call_meta", return_value=answer) as call:
+            with patch.object(worker, "call_meta_extract", return_value=answer) as call:
                 events = self.queue(db, action="extract", engine="meta", key="secret-test", model="muse-spark-1.3")
             self.assertEqual(call.call_count, 2)
-            self.assertIn("nunca instrucciones", call.call_args.args[3])  # prompt de extracción, no el del informe
+            self.assertIn("nunca instrucciones", call.call_args.args[0])  # prompt de extracción, no el del informe
             final = [e for e in events if e["type"] == "queue"][-1]
             self.assertEqual([(j["state"], j["detail"]) for j in final["jobs"]],
                              [("done", "1 afirmaciones verificadas")] * 2)
@@ -161,7 +161,7 @@ class DesktopTests(unittest.TestCase):
         from rezme import Store
         answer = json.dumps({"entities": [], "claims": []})
 
-        def meta(prompt, key, model, system=None, usage=None):
+        def meta(system, user, key, model, usage=None, notify=None):
             usage.update(prompt_tokens=100_000, completion_tokens=50_000)
             return answer
 
@@ -169,7 +169,7 @@ class DesktopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = self.extraction_db(tmp)
             # Solo el vídeo elegido (trabajo 2), aunque haya dos pendientes.
-            with patch.object(worker, "call_meta", side_effect=meta) as call:
+            with patch.object(worker, "call_meta_extract", side_effect=meta) as call:
                 events = self.queue(db, ids="2", budget="5", **options)
             self.assertEqual(call.call_count, 1)
             spend = [e for e in events if e["type"] == "spend"][-1]
@@ -192,7 +192,7 @@ class DesktopTests(unittest.TestCase):
         from rezme import Store
         cues = [(i * 30.0, f"frase {i} con algo de contenido") for i in range(80)]  # 40 min: 4-5 tramos
 
-        def meta(prompt, key, model, system=None, usage=None):
+        def meta(system, user, key, model, usage=None, notify=None):
             usage.update(prompt_tokens=100_000, completion_tokens=0)
             return json.dumps({"entities": [], "claims": []})
 
@@ -200,7 +200,7 @@ class DesktopTests(unittest.TestCase):
             db = self.extraction_db(tmp)
             with Store(db) as store:
                 store.save_transcript(1, cues, "whisper")
-            with patch.object(worker, "call_meta", side_effect=meta) as call:
+            with patch.object(worker, "call_meta_extract", side_effect=meta) as call:
                 events = self.queue(db, action="extract", engine="meta", key="k", model="m",
                                     price_in="2", price_out="10", budget="0.5")
             self.assertEqual(call.call_count, 3)  # 0,20 $ por llamada: la cuarta ya no se hace
@@ -210,7 +210,7 @@ class DesktopTests(unittest.TestCase):
                 done = store.get_run(1)["stats"]["tramos"]
                 self.assertEqual(len([t for t in done.values() if t["estado"] == "ok"]), 3)
             # Otra tanda continúa donde se quedó, sin repetir tramos.
-            with patch.object(worker, "call_meta", side_effect=meta) as call:
+            with patch.object(worker, "call_meta_extract", side_effect=meta) as call:
                 self.queue(db, action="extract", engine="meta", key="k", model="m",
                            price_in="2", price_out="10", budget="50")
             with Store(db) as store:
@@ -223,7 +223,7 @@ class DesktopTests(unittest.TestCase):
         from rezme import Store
         with tempfile.TemporaryDirectory() as tmp:
             db = self.extraction_db(tmp)
-            with patch.object(worker, "call_meta", side_effect=worker.MetaAccessError("La clave API no es válida.")) as call:
+            with patch.object(worker, "call_meta_extract", side_effect=worker.MetaAccessError("La clave API no es válida.")) as call:
                 with self.assertRaisesRegex(RuntimeError, "Extracción detenida: La clave API no es válida."):
                     self.queue(db, action="extract", engine="meta", key="mala", model="m")
             self.assertEqual(call.call_count, 1)  # ni reintentos ni el segundo vídeo
@@ -234,6 +234,88 @@ class DesktopTests(unittest.TestCase):
             with patch("rezme.backends.check_backend", return_value="No encuentro el CLI"):
                 with self.assertRaisesRegex(ValueError, "Claude Code"):
                     self.queue(db, action="extract", engine="claude-code")
+
+    def meta_responses(self, *items):
+        """Simula la API de Meta: cada elemento es una respuesta (dict) o un error HTTP (código, cabeceras, cuerpo)."""
+        import urllib.error
+        queue = list(items)
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(json.loads(request.data))
+            item = queue.pop(0)
+            if isinstance(item, tuple):
+                code, headers, body = item
+                raise urllib.error.HTTPError(request.full_url, code, "error", headers, io.BytesIO(body.encode()))
+            return io.StringIO(json.dumps(item))
+        return urlopen, sent
+
+    def test_extraction_waits_and_retries_when_meta_rate_limits(self):
+        ok = {"choices": [{"finish_reason": "stop", "message": {"content": '{"claims": []}'}}],
+              "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+        urlopen, sent = self.meta_responses((429, {"Retry-After": "7"}, "rate limit exceeded"),
+                                            (429, {}, "too many requests"), (503, {}, ""), ok, ok, ok)
+        notes, usage = [], {}
+        worker._pace["seconds"] = 0.0
+        with patch.object(worker.urllib.request, "urlopen", urlopen), patch("time.sleep") as sleep:
+            text = worker.call_meta_extract("SISTEMA", "texto", "k", "m", usage, notes.append)
+            self.assertEqual(text, '{"claims": []}')
+            # Respeta lo que pide Meta, después su propia espera creciente, y el error 503 aparte.
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [7.0, 40, 10])
+            self.assertIn("espero 7 s y sigo (intento 1 de 5)", notes[0])
+            self.assertEqual(usage["completion_tokens"], 5)
+            self.assertEqual(sent[0]["max_completion_tokens"], worker.EXTRACT_MAX_TOKENS)
+            self.assertEqual(sent[0]["messages"][0], {"role": "system", "content": "SISTEMA"})
+            # Tras los 429 deja una pausa entre llamadas, que se va relajando.
+            self.assertEqual(worker._pace["seconds"], 8.0)
+            sleep.reset_mock()
+            worker.call_meta_extract("S", "u", "k", "m")
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [8.0])
+            self.assertEqual(worker._pace["seconds"], 6.4)
+        worker._pace["seconds"] = 0.0
+
+    def test_extraction_gives_up_cleanly_if_meta_keeps_limiting(self):
+        import tempfile
+        from rezme import Store
+        urlopen, sent = self.meta_responses(*[(429, {}, "too many requests")] * 6)
+        worker._pace["seconds"] = 0.0
+        with tempfile.TemporaryDirectory() as tmp, patch.object(worker.urllib.request, "urlopen", urlopen), \
+                patch("time.sleep") as sleep:
+            db = self.extraction_db(tmp)
+            with self.assertRaisesRegex(RuntimeError, "sigue limitando las peticiones"):
+                self.queue(db, action="extract", engine="meta", key="k", model="m", price_in="1", price_out="1")
+            self.assertEqual((len(sent), sleep.call_count), (6, 5))  # un solo vídeo, sin reintentos en cadena
+            with Store(db) as store:
+                self.assertEqual({j["status"] for j in store.list_jobs()}, {"pending"})
+        worker._pace["seconds"] = 0.0
+
+    def test_exhausted_quota_is_not_retried(self):
+        urlopen, sent = self.meta_responses((429, {}, '{"error": {"message": "Insufficient balance"}}'))
+        with patch.object(worker.urllib.request, "urlopen", urlopen), patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(worker.MetaAccessError, "saldo o la cuota"):
+                worker.call_meta_extract("S", "u", "k", "m")
+        self.assertEqual((len(sent), sleep.call_count), (1, 0))
+
+    def test_truncated_meta_answer_is_salvaged_instead_of_failing(self):
+        import tempfile
+        from rezme import Store
+        cut = ('{"entities": [], "claims": [{"statement": "El autor estima 1,36 bps/Hz.", "type": "own_calculation", '
+               '"metric_value": 1.36, "quote": "con doble polarización, es de 1,36 bits por segundo y hercio"}, '
+               '{"statement": "Esta se queda a med')
+        answer = {"choices": [{"finish_reason": "length", "message": {"content": cut}}]}
+        urlopen, sent = self.meta_responses((400, {}, "max_completion_tokens is too large"), answer, answer)
+        worker._pace["seconds"] = 0.0
+        with tempfile.TemporaryDirectory() as tmp, patch.object(worker.urllib.request, "urlopen", urlopen), \
+                patch("time.sleep"):
+            db = self.extraction_db(tmp)
+            events = self.queue(db, action="extract", engine="meta", key="k", model="m", price_in="1", price_out="1")
+            # Si el modelo no admite respuestas tan largas, se baja al límite anterior.
+            self.assertEqual([p["max_completion_tokens"] for p in sent],
+                             [worker.EXTRACT_MAX_TOKENS, worker.REPORT_MAX_TOKENS, worker.EXTRACT_MAX_TOKENS])
+            self.assertEqual(events[-1]["type"], "done")
+            with Store(db) as store:
+                self.assertEqual(store.stats()["claims_by_status"], {"verified": 2})
+                self.assertTrue(store.get_run(1)["stats"]["tramos"]["0"]["truncada"])
 
     def test_queue_status_empty_and_bad_input(self):
         import os, tempfile

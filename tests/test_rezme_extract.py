@@ -200,6 +200,26 @@ class ParseTests(unittest.TestCase):
             self.assertTrue(parsed.fatal, text)
             self.assertTrue(parsed.errors)
 
+    def test_truncated_answer_keeps_the_complete_claims(self):
+        full = response(claim_json(), claim_json(statement="Segunda con llave } y \"comillas\" en el texto."),
+                        claim_json(statement="Tercera que se corta."))
+        cut = full[:full.index("Tercera") + 12]
+        parsed = ex.parse_response(cut, 1)
+        self.assertEqual((parsed.truncated, parsed.fatal, parsed.errors), (True, False, []))
+        self.assertEqual(len(parsed.candidates), 2)
+        self.assertIn("ast spacemobile", parsed.entities)  # las entidades iban antes y están completas
+        # Cortada antes de terminar ninguna afirmación: sigue siendo un fallo.
+        self.assertTrue(ex.parse_response(full[:full.index('"claims"') + 30], 1).fatal)
+        # Mal formada pero no cortada: no se rescata, se reintenta.
+        self.assertTrue(ex.parse_response('{"claims": [{"statement": "x",}]}', 1).fatal)
+
+    def test_compact_claims_only_need_statement_type_and_quote(self):
+        compact = json.dumps({"claims": [{"statement": "El IPC está en el 3,4 %.", "type": "statistic",
+                                          "quote": "el IPC está en el 3,4%"}]})
+        parsed = ex.parse_response(compact, 1)
+        claim = parsed.candidates[0].claim
+        self.assertEqual((parsed.errors, claim.evidence_grade, claim.stance, claim.attrs), ([], "none", "n/a", {}))
+
     def test_invalid_items_are_reported_and_valid_ones_kept(self):
         parsed = ex.parse_response(response(
             claim_json(),
@@ -266,7 +286,7 @@ class ExtractTests(ExtractBase):
 
         run = self.store.get_run(result.run_id)
         self.assertEqual((run["backend"], run["model"], run["prompt_version"], run["source_id"]),
-                         ("falso", "m1", "v1", self.src))
+                         ("falso", "m1", "v2", self.src))
         self.assertIsNone(run["cost_usd"])
         tramo = run["stats"]["tramos"]["0"]
         self.assertEqual((tramo["estado"], tramo["verified"], tramo["implicaciones_degradadas"]),
@@ -425,13 +445,13 @@ class ExtractTests(ExtractBase):
     def test_new_prompt_version_creates_new_run_and_keeps_history(self):
         first, _ = self.run_with(response(claim_json()))
         with tempfile.TemporaryDirectory() as tmp:
-            for version in ("v1", "v2"):
-                shutil.copytree(Path(prompts.__file__).parent / "v1", Path(tmp) / version)
+            for version in ("v2", "v3"):
+                shutil.copytree(Path(prompts.__file__).parent / "v2", Path(tmp) / version)
             with mock.patch.object(prompts, "_DIR", Path(tmp)):
-                second, llm = self.run_with(response(claim_json()), prompt_version="v2")
+                second, llm = self.run_with(response(claim_json()), prompt_version="v3")
         self.assertEqual(len(llm.calls), 1)
         self.assertNotEqual(second.run_id, first.run_id)
-        self.assertEqual(self.store.get_run(second.run_id)["prompt_version"], "v2")
+        self.assertEqual(self.store.get_run(second.run_id)["prompt_version"], "v3")
         by_run = {c["run_id"]: c["status"] for c in self.claims()}
         self.assertEqual(by_run, {first.run_id: "superseded", second.run_id: "verified"})
         self.assertEqual(second.superseded, 1)
@@ -439,7 +459,7 @@ class ExtractTests(ExtractBase):
 
     def test_domain_changes_prompt_and_version_label(self):
         result, llm = self.run_with(response(), domain="macro")
-        self.assertEqual(result.prompt_version, "v1+macro")
+        self.assertEqual(result.prompt_version, "v2+macro")
         self.assertIn("Macro y economía", llm.calls[0][0])
         self.assertNotIn("### Cripto", llm.calls[0][0])
         with self.assertRaisesRegex(ValueError, "Dominio no válido"):
@@ -481,6 +501,18 @@ class ExtractTests(ExtractBase):
             usage = run["stats"]["consumo"]
             self.assertEqual((usage["entrada"], usage["salida"], usage["llamadas"]), (1000, 200, 1))
             self.assertGreater(usage["caracteres_prompt"], usage["caracteres_transcripcion"])
+
+    def test_truncated_chunk_is_stored_and_flagged_without_retry(self):
+        full = response(claim_json(), claim_json(statement="Se corta aquí."))
+        result, llm = self.run_with(full[:full.index("Se corta") + 5])
+        self.assertEqual((len(llm.calls), result.verified), (1, 1))
+        self.assertTrue(self.store.get_run(result.run_id)["stats"]["tramos"]["0"]["truncada"])
+
+    def test_prompt_asks_for_compact_output(self):
+        system = prompts.system_prompt()
+        self.assertIn("Salida compacta", system)
+        self.assertIn("Como máximo 25 afirmaciones", system)
+        self.assertNotIn(": null", system)
 
     def test_missing_source_or_transcript(self):
         with self.assertRaisesRegex(ValueError, "no existe"):

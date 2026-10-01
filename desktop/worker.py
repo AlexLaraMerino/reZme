@@ -32,26 +32,74 @@ class MetaAccessError(RuntimeError):
     """Meta rechaza la petición por clave, permisos, modelo o saldo: reintentar no lo arregla."""
 
 
-def call_meta(prompt, key, model, system=None, usage=None):
-    """Una llamada a Meta. Si se pasa `usage` (dict), se rellena con los tokens que informe la API."""
+class MetaRateLimit(RuntimeError):
+    """Demasiadas peticiones (429). `retry_after` son los segundos que pide esperar Meta, si lo dice."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+META_URL = "https://api.meta.ai/v1/chat/completions"
+REPORT_MAX_TOKENS = 12000
+# La extracción devuelve JSON largo y algunos modelos gastan tokens en razonar antes de escribir.
+EXTRACT_MAX_TOKENS = 32000
+# Esperas ante un 429 cuando Meta no indica cuánto esperar, y ante errores pasajeros.
+RATE_WAITS = (20, 40, 80, 160, 300)
+ERROR_WAITS = (10, 30)
+MAX_RETRY_AFTER = 600
+MAX_PACE = 30.0
+_QUOTA_HINTS = ("insufficient", "quota", "billing", "balance", "credit", "payment", "saldo")
+# Pausa entre llamadas de extracción; crece cuando Meta responde 429 y se relaja si todo va bien.
+_pace = {"seconds": 0.0}
+
+
+def _retry_after(headers):
+    try:
+        return min(float(headers.get("Retry-After")), MAX_RETRY_AFTER)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _meta_request(messages, key, model, max_tokens):
+    """Una petición a Meta. Devuelve la respuesta ya decodificada o lanza un error clasificado."""
     request = urllib.request.Request(
-        "https://api.meta.ai/v1/chat/completions",
-        data=json.dumps({"model": model, "messages": [
-            {"role": "system", "content": system or digest.SYSTEM},
-            {"role": "user", "content": prompt},
-        ], "max_completion_tokens": 12000}).encode(),
+        META_URL,
+        data=json.dumps({"model": model, "messages": messages, "max_completion_tokens": max_tokens}).encode(),
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(request, timeout=240) as response:
-            data = json.load(response)
+            return json.load(response)
     except urllib.error.HTTPError as error:
-        messages = {401: "La clave API no es válida.", 403: "Tu cuenta no tiene acceso a este modelo.",
-                    404: "No se encuentra el modelo. Revisa su nombre en los ajustes.",
-                    429: "Meta ha alcanzado el límite de uso o saldo de tu cuenta. Inténtalo más tarde."}
-        if error.code in messages:
-            raise MetaAccessError(messages[error.code]) from None
+        try:
+            detail = error.read().decode("utf-8", "replace")[:2000].lower()
+        except Exception:
+            detail = ""
+        finally:
+            error.close()
+        access = {401: "La clave API no es válida.", 403: "Tu cuenta no tiene acceso a este modelo.",
+                  404: "No se encuentra el modelo. Revisa su nombre en los ajustes."}
+        if error.code in access:
+            raise MetaAccessError(access[error.code]) from None
+        if error.code == 429:
+            if any(hint in detail for hint in _QUOTA_HINTS):
+                raise MetaAccessError("Meta indica que se ha agotado el saldo o la cuota de tu cuenta.") from None
+            raise MetaRateLimit("Meta está limitando las peticiones.", _retry_after(error.headers)) from None
+        if error.code == 400 and "token" in detail:
+            raise ValueError("max_tokens") from None
         raise RuntimeError(f"Meta devolvió un error ({error.code}). Inténtalo más tarde.") from None
+
+
+def call_meta(prompt, key, model, system=None, usage=None):
+    """Una llamada a Meta para el informe. Si se pasa `usage` (dict), se rellena con los tokens usados."""
+    messages = [{"role": "system", "content": system or digest.SYSTEM}, {"role": "user", "content": prompt}]
+    try:
+        data = _meta_request(messages, key, model, REPORT_MAX_TOKENS)
+    except MetaRateLimit:
+        raise MetaAccessError("Meta ha alcanzado el límite de uso o saldo de tu cuenta. Inténtalo más tarde.") from None
+    except ValueError:
+        raise RuntimeError("Meta devolvió un error (400). Inténtalo más tarde.") from None
     if usage is not None and isinstance(data.get("usage"), dict):
         usage.update(data["usage"])
     choice = data["choices"][0]
@@ -60,6 +108,58 @@ def call_meta(prompt, key, model, system=None, usage=None):
     result = choice["message"].get("content", "")
     if not isinstance(result, str) or not result.strip():
         raise RuntimeError("Meta no devolvió texto. Prueba otra vez o utiliza el modo prompt.")
+    return result.strip()
+
+
+def call_meta_extract(system, user, key, model, usage=None, notify=None):
+    """Una llamada a Meta para la extracción, paciente con los límites de peticiones.
+
+    - Ante un 429 espera lo que diga Meta (o cada vez más) y reintenta; además, deja una pausa
+      entre llamadas que crece con cada 429 y se relaja cuando deja de haberlos.
+    - Si la respuesta se corta por longitud, la devuelve tal cual: el extractor rescata las
+      afirmaciones completas en lugar de perder el tramo.
+    - Solo renuncia (MetaRateLimit) si Meta sigue limitando tras todas las esperas.
+    """
+    import time
+
+    notify = notify or (lambda message: None)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    max_tokens = EXTRACT_MAX_TOKENS
+    limited = errors = 0
+    if _pace["seconds"] >= 1:
+        time.sleep(_pace["seconds"])
+    while True:
+        try:
+            data = _meta_request(messages, key, model, max_tokens)
+            break
+        except ValueError:  # el modelo no admite una respuesta tan larga
+            if max_tokens == REPORT_MAX_TOKENS:
+                raise RuntimeError("Meta devolvió un error (400). Inténtalo más tarde.") from None
+            max_tokens = REPORT_MAX_TOKENS
+        except MetaRateLimit as error:
+            _pace["seconds"] = min(max(_pace["seconds"] * 2, 4.0), MAX_PACE)
+            if limited >= len(RATE_WAITS):
+                raise
+            wait = error.retry_after or RATE_WAITS[limited]
+            limited += 1
+            notify(f"Meta limita las peticiones: espero {int(wait)} s y sigo (intento {limited} de {len(RATE_WAITS)})…")
+            time.sleep(wait)
+        except (MetaAccessError, KeyboardInterrupt):
+            raise
+        except (RuntimeError, OSError) as error:  # 5xx, red, tiempo de espera
+            if errors >= len(ERROR_WAITS):
+                raise RuntimeError(str(error) or "No se pudo contactar con Meta.") from None
+            wait = ERROR_WAITS[errors]
+            errors += 1
+            notify(f"Meta no responde bien: espero {wait} s y reintento…")
+            time.sleep(wait)
+    if not limited:
+        _pace["seconds"] = _pace["seconds"] * 0.8 if _pace["seconds"] >= 1.25 else 0.0
+    if usage is not None and isinstance(data.get("usage"), dict):
+        usage.update(data["usage"])
+    result = data["choices"][0]["message"].get("content", "")
+    if not isinstance(result, str) or not result.strip():
+        raise RuntimeError("Meta no devolvió texto en este tramo.")
     return result.strip()
 
 
@@ -159,9 +259,14 @@ def extraction_backend(options):
 
         def ask(system, user):
             try:
-                return call_meta(user, key, model, system, usage)
+                return call_meta_extract(system, user, key, model, usage,
+                                         notify=lambda message: emit("progress", message=message))
             except MetaAccessError as error:
                 raise backends.BackendUnavailable(str(error)) from None
+            except MetaRateLimit:
+                raise backends.BackendUnavailable(
+                    "Meta sigue limitando las peticiones después de varias esperas. Vuelve a lanzar la "
+                    "extracción más tarde: continuará donde lo dejó.") from None
         backend = backends.Backend("meta", model, ask)
     elif engine == "claude-code":
         if backends.check_backend("claude-code"):
