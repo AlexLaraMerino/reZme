@@ -309,7 +309,7 @@ def run_queue(options):
     from rezme import Store, batch
 
     action = options.get("action", "status")
-    if action not in ("status", "run", "extract", "retry", "clear"):
+    if action not in ("status", "run", "extract", "retry", "clear", "reextract"):
         raise ValueError("Acción de cola no válida.")
     if not options.get("db"):
         raise ValueError("No se encuentra la base de datos de reZme.")
@@ -322,6 +322,17 @@ def run_queue(options):
             store.retry_jobs(status="skipped")
         elif action == "clear":
             store.clear_done_jobs()
+        elif action == "reextract":
+            # Vuelve a poner un vídeo en la lista de extracción (p. ej. tras mejorar el prompt).
+            # La extracción anterior se conserva como histórico hasta que termine la nueva.
+            source = store.get_source_by_id(int(options["source"])) if str(options.get("source") or "").isdigit() else None
+            if source is None or not store.latest_transcript(source["id"]):
+                raise ValueError("Ese vídeo no tiene transcripción guardada.")
+            url = source["url"] or f"https://www.youtube.com/watch?v={source['external_id']}"
+            job_id, created = store.enqueue_job(source["external_id"], url, title=source["title"], stage="extract")
+            if not created:
+                store.update_job(job_id, status="pending", stage="extract", attempts=0, last_error=None,
+                                 notes=None, started_at=None, finished_at=None)
         elif action == "extract":
             from rezme import extract
             backend, spent = extraction_backend(options)
@@ -395,7 +406,20 @@ TYPE_LABELS = {
     "fact": "Hecho", "statistic": "Dato", "study_result": "Estudio", "causal_claim": "Causa y efecto",
     "forecast": "Previsión", "opinion": "Opinión", "own_calculation": "Cálculo del autor",
     "recommendation": "Recomendación", "risk": "Riesgo", "catalyst": "Catalizador",
-    "methodology": "Método", "definition": "Definición"}
+    "methodology": "Método", "definition": "Definición", "mechanism": "Mecanismo",
+    "mental_model": "Modelo mental", "heuristic": "Heurística", "framework": "Marco de análisis",
+    "historical_case": "Caso histórico"}
+TAG_LABELS = {
+    "valuation": "valoración", "business_quality": "calidad del negocio",
+    "competitive_advantage": "ventaja competitiva", "management": "directiva",
+    "capital_allocation": "asignación de capital", "accounting": "contabilidad", "risk": "riesgo",
+    "position_sizing": "tamaño de posición", "market_structure": "estructura de mercado",
+    "macro": "macro", "liquidity": "liquidez", "behavioral": "conducta"}
+RELATION_LABELS = {
+    "supports": "apoya", "contradicts": "contradice", "refines": "matiza", "causes": "causa",
+    "caused_by": "es causada por", "example_of": "es un ejemplo de",
+    "counterexample_of": "es un contraejemplo de", "depends_on": "depende de",
+    "related_to": "se relaciona con", "generalizes": "generaliza", "specializes": "concreta"}
 DIRECTION_LABELS = {"positive": "positivo", "negative": "negativo", "mixed": "mixto", "unclear": "incierto"}
 BASIS_LABELS = {"stated_by_source": "lo dice el autor", "inferred_by_system": "deducido por el modelo"}
 
@@ -421,14 +445,28 @@ def source_detail(store, source_id):
             text = f"{item['target_label']}: {DIRECTION_LABELS.get(item['direction'], item['direction'])}"
             if item["mechanism"]:
                 text += f" — {item['mechanism']}"
+            if item["conditional_on"]:
+                text += f" · si {item['conditional_on']}"
             implications.append(text + f" ({BASIS_LABELS.get(item['basis'], item['basis'])})")
+        knowledge = lambda name: [{"text": k["text"], "stated": k["basis"] == "stated_by_source"}
+                                  for k in row[name]]
+        relations = []
+        for rel in store.relations_for(row["id"]):
+            label = RELATION_LABELS.get(rel["relation"], rel["relation"])
+            arrow = label.capitalize() if rel["direction"] == "out" else f"Otra afirmación la {label}" \
+                if rel["relation"] in ("supports", "contradicts", "refines", "causes", "generalizes", "specializes") \
+                else f"Relacionada ({label})"
+            relations.append(f"{arrow}: {rel['other_statement']}")
         claims.append({
             "id": row["id"], "verified": row["status"] == "verified", "statement": row["statement"],
             "kind": TYPE_LABELS.get(row["type"], row["type"]), "entity": row["entity_name"] or "",
             "metric": metric, "time": digest.hms(row["ts_start"]) if row["ts_start"] is not None else "",
             "link": link, "quote": row["quote"] or "",
             "reasons": row["attrs"].get("grounding", {}).get("motivos", []),
-            "implications": implications})
+            "implications": implications, "title": row["title"] or "",
+            "mechanism": knowledge("mechanism"), "applies_when": knowledge("applies_when"),
+            "fails_when": knowledge("fails_when"),
+            "tags": [TAG_LABELS.get(tag, tag) for tag in row["tags"]], "relations": relations})
     return {"id": source_id, "title": source["title"] or source["external_id"], "url": source["url"] or "",
             "claims": claims}
 

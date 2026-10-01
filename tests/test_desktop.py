@@ -148,6 +148,11 @@ class DesktopTests(unittest.TestCase):
             self.assertTrue(any("Uno · Tramo 1/1" in e.get("message", "") for e in events))
             self.assertEqual(events[-1]["type"], "done")
             self.assertIn("gasto de la tanda", events[-1]["message"])
+            # Volver a extraer un vídeo ya hecho lo devuelve a la lista sin borrar lo anterior.
+            again = self.queue(db, action="reextract", source="1")[-1]
+            self.assertEqual([j["state"] for j in again["jobs"]], ["saved", "done"])
+            with self.assertRaisesRegex(ValueError, "transcripción"):
+                self.queue(db, action="reextract", source="99")
             self.assertEqual(len([e for e in events if e["type"] == "spend"]), 2)
             self.assertNotIn("secret-test", json.dumps(events))
             with Store(db) as store:
@@ -349,7 +354,11 @@ class DesktopTests(unittest.TestCase):
                 good, _ = store.add_claim(Claim(
                     source_id=src, run_id=run, statement="El petróleo supera los 100 dólares.", type="risk",
                     status="verified", entity_id=entity, metric_value=100.0, metric_unit="USD", ts_start=235.4,
-                    quote="el petróleo por encima de $100"))
+                    quote="el petróleo por encima de $100", title="Petróleo caro y contagio",
+                    mechanism=[{"text": "La energía encarece el resto de precios.", "basis": "stated_by_source",
+                                "quote": "se contagia"}],
+                    fails_when=[{"text": "El petróleo baja pronto.", "basis": "inferred_by_system"}],
+                    tags=["macro", "risk"]))
                 store.add_implication(Implication(claim_id=good, direction="negative", basis="inferred_by_system",
                                                   target_label="bonos largos", mechanism="más inflación"))
                 store.add_claim(Claim(source_id=src, run_id=run, statement="Bajó una décima.", type="statistic",
@@ -367,8 +376,13 @@ class DesktopTests(unittest.TestCase):
                          (True, "Riesgo", "IPC", "100 USD", "00:03:55"))
         self.assertEqual(claim["link"], "https://www.youtube.com/watch?v=aaaaaaaaaa1&t=235s")
         self.assertEqual(claim["implications"], ["bonos largos: negativo — más inflación (deducido por el modelo)"])
+        self.assertEqual((claim["title"], claim["tags"]), ("Petróleo caro y contagio", ["macro", "riesgo"]))
+        self.assertEqual(claim["mechanism"], [{"text": "La energía encarece el resto de precios.", "stated": True}])
+        self.assertEqual((claim["applies_when"], claim["fails_when"]),
+                         ([], [{"text": "El petróleo baja pronto.", "stated": False}]))
         self.assertEqual((detail["claims"][1]["verified"], detail["claims"][1]["reasons"]),
                          (False, ["la cifra 0.1 no aparece en el tramo"]))
+        self.assertEqual(hits["items"][0]["statement"], "La inflación subyacente baja al 2,4 %.")
         self.assertEqual(library["stats"], {"videos": 1, "verified": 2, "ungrounded": 2, "entities": 1,
                                             "to_extract": 0, "calls": 0, "calibrated": 0})
         self.assertNotIn("job", library["sources"][0])

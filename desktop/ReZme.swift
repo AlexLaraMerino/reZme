@@ -58,6 +58,13 @@ struct LibrarySource: Identifiable {
     var tokensOut = 0
 }
 
+/// Un paso del mecanismo o una condición, y si lo dice el autor o lo deduce el modelo.
+struct KnowledgeItem: Identifiable {
+    let id = UUID()
+    let text: String
+    let stated: Bool
+}
+
 struct ClaimItem: Identifiable {
     let id: Int
     let verified: Bool
@@ -70,6 +77,12 @@ struct ClaimItem: Identifiable {
     let quote: String
     let reasons: [String]
     let implications: [String]
+    var title = ""
+    var mechanism: [KnowledgeItem] = []
+    var appliesWhen: [KnowledgeItem] = []
+    var failsWhen: [KnowledgeItem] = []
+    var tags: [String] = []
+    var relations: [String] = []
 }
 
 struct SourceDetail {
@@ -356,6 +369,19 @@ final class AppModel: ObservableObject {
         detail = SourceDetail(id: source.id, title: source.title, url: source.url, claims: [])
         loadLibrary()
     }
+    /// Devuelve el vídeo abierto a la lista de extracción, para rehacerlo con el prompt actual.
+    func reextract() {
+        guard busy == nil, let detail else { return }
+        let started = launch(["mode": "queue", "action": "reextract", "db": database.path, "source": String(detail.id)],
+                             owner: nil, onEvent: { event in self.queueEvent(event) },
+                             onExit: { ok in
+                                 guard ok else { return }
+                                 self.detail = nil; self.excluded = []
+                                 self.status = "Vídeo devuelto a la lista: selecciónalo y pulsa «Extraer selección»."; self.error = false
+                                 self.loadLibrary()
+                             })
+        if !started { fail("No se pudo preparar la reextracción.") }
+    }
     func openLink(_ link: String) {
         if let url = URL(string: link), !link.isEmpty { NSWorkspace.shared.open(url) }
     }
@@ -370,12 +396,20 @@ final class AppModel: ObservableObject {
                 guard let id = event["id"] as? Int, id == self.detail?.id else { break }
                 let claims: [ClaimItem] = (event["claims"] as? [[String: Any]] ?? []).compactMap { item in
                     guard let claimID = item["id"] as? Int else { return nil }
+                    let knowledge: (String) -> [KnowledgeItem] = { name in
+                        (item[name] as? [[String: Any]] ?? []).map {
+                            KnowledgeItem(text: $0["text"] as? String ?? "", stated: $0["stated"] as? Bool ?? false)
+                        }
+                    }
                     return ClaimItem(id: claimID, verified: item["verified"] as? Bool ?? false,
                                      statement: item["statement"] as? String ?? "", kind: item["kind"] as? String ?? "",
                                      entity: item["entity"] as? String ?? "", metric: item["metric"] as? String ?? "",
                                      time: item["time"] as? String ?? "", link: item["link"] as? String ?? "",
                                      quote: item["quote"] as? String ?? "", reasons: item["reasons"] as? [String] ?? [],
-                                     implications: item["implications"] as? [String] ?? [])
+                                     implications: item["implications"] as? [String] ?? [],
+                                     title: item["title"] as? String ?? "", mechanism: knowledge("mechanism"),
+                                     appliesWhen: knowledge("applies_when"), failsWhen: knowledge("fails_when"),
+                                     tags: item["tags"] as? [String] ?? [], relations: item["relations"] as? [String] ?? [])
                 }
                 self.detail = SourceDetail(id: id, title: event["title"] as? String ?? "", url: event["url"] as? String ?? "", claims: claims)
             case "library":
@@ -679,8 +713,26 @@ struct ContentView: View {
 
     // MARK: Base de conocimiento
 
+    /// Bloque «Por qué / Aplica cuando / Falla cuando». La comilla marca lo que dice el autor.
+    @ViewBuilder func knowledgeBlock(_ title: String, _ items: [KnowledgeItem]) -> some View {
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                ForEach(items) { item in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: item.stated ? "quote.opening" : "sparkle").font(.caption2)
+                            .foregroundStyle(item.stated ? accent : Color.secondary).frame(width: 12).padding(.top, 2)
+                            .help(item.stated ? "Lo dice el autor" : "Deducido por el modelo")
+                        Text(item.text).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }.padding(.top, 2)
+        }
+    }
+
     func claimRow(_ claim: ClaimItem) -> some View {
         VStack(alignment: .leading, spacing: 5) {
+            if !claim.title.isEmpty { Text(claim.title).font(.system(size: 14, weight: .semibold)) }
             Text(claim.statement).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 6) {
                 Text(claim.kind).font(.caption.weight(.medium)).foregroundStyle(accent)
@@ -698,8 +750,17 @@ struct ContentView: View {
                 Text("«\(claim.quote)»").font(.caption).italic().foregroundStyle(.secondary).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            knowledgeBlock("POR QUÉ", claim.mechanism)
+            knowledgeBlock("APLICA CUANDO", claim.appliesWhen)
+            knowledgeBlock("FALLA CUANDO", claim.failsWhen)
+            if !claim.tags.isEmpty {
+                Text("Sirve para: " + claim.tags.joined(separator: ", ")).font(.caption).foregroundStyle(.secondary)
+            }
             ForEach(claim.implications, id: \.self) { implication in
                 Label(implication, systemImage: "arrow.turn.down.right").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(claim.relations, id: \.self) { relation in
+                Label(relation, systemImage: "link").font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
             ForEach(claim.reasons, id: \.self) { reason in
                 Label("No verificada: \(reason)", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Color.orange)
@@ -714,11 +775,21 @@ struct ContentView: View {
             HStack(alignment: .top) {
                 Text(detail.title).font(.system(size: 22, weight: .semibold, design: .serif)).lineLimit(2)
                 Spacer()
+                if !detail.claims.isEmpty {
+                    Button { app.reextract() } label: { Label("Volver a extraer", systemImage: "arrow.clockwise") }
+                        .disabled(app.busy != nil).help("Rehace la extracción de este vídeo con la versión actual. La anterior se conserva como histórico.")
+                }
                 if !detail.url.isEmpty { Button { app.openLink(detail.url) } label: { Label("Ver en YouTube", systemImage: "play.rectangle") } }
             }.padding(.bottom, 4)
             Text(detail.claims.isEmpty ? "Aún no se han extraído afirmaciones de este vídeo."
                  : "\(detail.verified.count) afirmaciones verificadas · \(detail.unverified.count) sin verificar")
-                .font(.callout).foregroundStyle(.secondary).padding(.bottom, 14)
+                .font(.callout).foregroundStyle(.secondary).padding(.bottom, 6)
+            if !detail.claims.isEmpty {
+                HStack(spacing: 14) {
+                    Label("lo dice el autor", systemImage: "quote.opening").foregroundStyle(accent)
+                    Label("deducido por el modelo", systemImage: "sparkle").foregroundStyle(.secondary)
+                }.font(.caption).padding(.bottom, 12)
+            }
             if detail.claims.isEmpty {
                 emptyState("text.badge.checkmark", "Sin afirmaciones todavía", "Vuelve a la base, selecciona este vídeo\ny pulsa «Extraer selección».")
             } else {

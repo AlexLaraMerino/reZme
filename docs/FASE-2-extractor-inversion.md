@@ -210,3 +210,24 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   se relaja después. Solo se detiene el lote si Meta sigue limitando tras todas
   las esperas, o si el 429 es por saldo o cuota agotados.
 
+## 10. Unidad de conocimiento (esquema v4, prompt v3)
+
+`K = afirmación + mecanismo + evidencia + aplicabilidad + límites + implicaciones + procedencia + relaciones`
+
+- Cada afirmación puede llevar `title`, `mechanism` (por qué ocurre),
+  `applies_when` (cuándo vale), `fails_when` (cuándo falla o qué la refutaría) y
+  `tags` de decisión (valoración, ventaja competitiva, riesgo…).
+- Cada elemento de esas listas marca si lo dice el autor (`stated_by_source`, con
+  cita localizable en el tramo) o lo deduce el modelo (`inferred_by_system`). Sin
+  cita comprobable se degrada a deducido, igual que en las implicaciones.
+- Tipos nuevos para conocimiento que dura y no caduca: `mechanism`,
+  `mental_model`, `heuristic`, `framework`, `historical_case`.
+- `claim_relations` enlaza afirmaciones (apoya, contradice, matiza, es ejemplo
+  de…). Por ahora solo dentro de una misma respuesta del modelo; las relaciones
+  entre vídeos son parte de M3.
+- Las implicaciones admiten `conditional_on`.
+- Pendiente de la propuesta original: lista estructurada de evidencias, calidad
+  en varias dimensiones y búsqueda semántica (M4).
+- La migración v3 → v4 reconstruye la tabla `claims` y deja antes una copia
+  `rezme.db.v3.bak` junto a la base.
+
