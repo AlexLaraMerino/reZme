@@ -1,0 +1,2 @@
+### Ciencia y medicina
+Entidades: `drug`, `disease`, `biological_concept`, `technology`, `organization`. Para estudios usa `study_result` y anota en `attrs`, solo si se dicen: `diseno` (ensayo aleatorizado, observacional, preclínico…), `n`, `fase`, `efecto`, `comparador`. No conviertas correlación en `causal_claim` si el autor no lo afirma. Las implicaciones sobre empresas casi siempre son `inferred_by_system`.

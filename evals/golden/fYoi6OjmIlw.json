@@ -1,0 +1,28 @@
+{
+  "video_id": "fYoi6OjmIlw",
+  "url": "https://www.youtube.com/watch?v=fYoi6OjmIlw",
+  "title": "Hablemos de $ASTS",
+  "channel": "Emérito Quintana",
+  "status": "borrador_sin_revisar",
+  "exhaustive": false,
+  "notes": "Redactado a partir del informe en prosa (reZme-informe_ ASTS_EMERITO.md), no de la transcripción. Cifras y marcas de tiempo sin comprobar contra el vídeo.",
+  "claims": [
+    {"id": "asts-01", "statement": "El autor estima una eficiencia espectral realista de 1,36 bps/Hz con doble polarización.", "type": "own_calculation", "keywords": ["eficiencia espectral"], "metric_value": 1.36, "metric_unit": "bps/Hz", "ts": "02:01:14"},
+    {"id": "asts-02", "statement": "Según la GSMA, solo 170 millones de personas carecen de toda cobertura móvil.", "type": "statistic", "keywords": ["gsma"], "metric_value": 170, "metric_unit": "millones de personas", "ts": "00:13:09"},
+    {"id": "asts-03", "statement": "Solo el 2,1 % del suelo de EE. UU. no tiene servicio declarado por ninguna operadora.", "type": "statistic", "keywords": [["suelo", "territorio", "superficie"], ["servicio", "cobertura"]], "metric_value": 2.1, "metric_unit": "%", "ts": "00:19:53"},
+    {"id": "asts-04", "statement": "El servicio T-Mobile–Starlink representa el 0,002 % del tráfico.", "type": "statistic", "keywords": ["starlink", ["trafico", "traffic"]], "metric_value": 0.002, "metric_unit": "%", "ts": "00:26:05"},
+    {"id": "asts-05", "statement": "Un móvil solo emite 200 mW, sin ganancia de antena.", "type": "fact", "keywords": [["movil", "telefono", "terminal"], ["mw", "milivatios"]], "metric_value": 200, "metric_unit": "mW", "ts": "01:10:15"},
+    {"id": "asts-06", "statement": "La antena del satélite de AST mide 223 m2.", "type": "fact", "keywords": ["antena"], "metric_value": 223, "metric_unit": "m2", "ts": "01:10:15"},
+    {"id": "asts-07", "statement": "Mediciones de la UPM sobre Starlink dan una eficiencia espectral media de 0,61 bps/Hz.", "type": "statistic", "keywords": ["starlink", ["upm", "politecnica"]], "metric_value": 0.61, "metric_unit": "bps/Hz", "ts": "01:48:00"},
+    {"id": "asts-08", "statement": "En EE. UU. el usuario típico solo dispone de 1,4 MHz de espectro en banda baja.", "type": "own_calculation", "keywords": [["mhz", "megahercios"]], "metric_value": 1.4, "metric_unit": "MHz", "ts": "02:03:18"},
+    {"id": "asts-09", "statement": "La constelación completa daría unos 72 Gbps de capacidad.", "type": "own_calculation", "keywords": [["constelacion", "flota"]], "metric_value": 72, "metric_unit": "Gbps", "ts": "02:13:22"},
+    {"id": "asts-10", "statement": "La capacidad por satélite es de 1,17 Gbps al límite de potencia.", "type": "own_calculation", "keywords": [["satelite"], ["gbps", "gigabits"]], "metric_value": 1.17, "metric_unit": "Gbps", "ts": "02:13:22"},
+    {"id": "asts-11", "statement": "La banda L de Ligado aportaría 20 MHz de bajada.", "type": "fact", "keywords": ["ligado"], "metric_value": 20, "metric_unit": "MHz", "ts": "02:24:29"},
+    {"id": "asts-12", "statement": "El récord de 98 Mbps se logró en aguas internacionales y no es extrapolable.", "type": "fact", "keywords": [["record"], ["aguas internacionales", "mbps"]], "metric_value": 98, "metric_unit": "Mbps", "ts": "02:44:37"},
+    {"id": "asts-13", "statement": "El CEO monetizó unos 200 millones mediante collars sin vender en mercado.", "type": "fact", "keywords": [["collar", "collars"]], "metric_value": 200, "metric_unit": "millones USD", "ts": "03:19:27"},
+    {"id": "asts-14", "statement": "El acuerdo TRA cede el 85 % del ahorro fiscal a los socios fundadores.", "type": "fact", "keywords": [["tra", "tax receivable"]], "metric_value": 85, "metric_unit": "%", "ts": "03:19:27"},
+    {"id": "asts-15", "statement": "El escenario optimista a 2036 exige 6,66 dólares al mes por línea en Norteamérica.", "type": "own_calculation", "keywords": [["norteamerica", "north america"]], "metric_value": 6.66, "metric_unit": "USD/mes", "ts": "03:39:51"},
+    {"id": "asts-16", "statement": "Numantia vendió toda su posición en AST.", "type": "recommendation", "keywords": [["vend*"], ["posicion"]], "metric_value": null, "ts": "03:52:33"},
+    {"id": "asts-17", "statement": "AST queda limitado a un servicio de respaldo de baja capacidad, no a banda ancha masiva.", "type": "opinion", "keywords": [["respaldo", "seguro", "backup"]], "metric_value": null, "ts": "02:50:54"}
+  ]
+}

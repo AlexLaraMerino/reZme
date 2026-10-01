@@ -60,7 +60,10 @@ CREATE TABLE extraction_runs (
     model TEXT, backend TEXT, prompt_version TEXT,
     schema_version INTEGER NOT NULL,
     cost_usd REAL, notes TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    source_id INTEGER REFERENCES sources(id) ON DELETE CASCADE,
+    transcript_id INTEGER REFERENCES transcripts(id) ON DELETE SET NULL,
+    stats_json TEXT NOT NULL DEFAULT '{{}}'
 );
 
 CREATE TABLE entities (
@@ -156,6 +159,16 @@ CREATE TABLE source_profiles (
 );
 """
 
+# Pasos desde cada versión antigua hasta la actual.
+_MIGRATIONS = {
+    1: """
+ALTER TABLE extraction_runs ADD COLUMN source_id INTEGER REFERENCES sources(id) ON DELETE CASCADE;
+ALTER TABLE extraction_runs ADD COLUMN transcript_id INTEGER
+    REFERENCES transcripts(id) ON DELETE SET NULL;
+ALTER TABLE extraction_runs ADD COLUMN stats_json TEXT NOT NULL DEFAULT '{}';
+""",
+}
+
 _STATS_TABLES = ("sources", "transcripts", "entities", "claims", "implications",
                  "forecasts", "extraction_runs")
 
@@ -194,6 +207,10 @@ class Store:
         if version == 0:
             with self.db:
                 self.db.executescript(DDL)
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif version < SCHEMA_VERSION:
+            with self.db:
+                self.db.executescript(_MIGRATIONS[version])
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -242,6 +259,9 @@ class Store:
         return _row(self.db.execute(
             "SELECT * FROM sources WHERE platform=? AND external_id=?",
             (platform, external_id)).fetchone())
+
+    def get_source_by_id(self, source_id: int) -> dict[str, Any] | None:
+        return _row(self.db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone())
 
     def save_transcript(self, source_id: int, cues: list[tuple[float, str]], origin: str,
                         language: str | None = None) -> tuple[int, bool]:
@@ -329,6 +349,14 @@ class Store:
             raise AmbiguousEntity(f"{name!r} coincide con {len(ids)} entidades; indica el tipo")
         return ids[0] if ids else None
 
+    def entity_candidates(self, name: str) -> list[dict[str, Any]]:
+        """Todas las entidades que responden a ese nombre o alias (para anotar ambigüedades)."""
+        norm = normalize_name(name)
+        return [dict(r) for r in self.db.execute(
+            """SELECT DISTINCT e.id, e.type, e.canonical_name FROM entities e
+               LEFT JOIN entity_aliases a ON a.entity_id = e.id
+               WHERE e.norm_name = ? OR a.norm_alias = ? ORDER BY e.id""", (norm, norm))]
+
     def get_entity(self, entity_id: int) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM entities WHERE id=?", (entity_id,)).fetchone()
         if row is None:
@@ -343,13 +371,60 @@ class Store:
 
     def start_run(self, *, model: str | None = None, backend: str | None = None,
                   prompt_version: str | None = None, cost_usd: float | None = None,
-                  notes: str | None = None) -> int:
+                  notes: str | None = None, source_id: int | None = None,
+                  transcript_id: int | None = None) -> int:
         with self.db:
             cur = self.db.execute(
                 """INSERT INTO extraction_runs (model, backend, prompt_version, schema_version,
-                    cost_usd, notes, created_at) VALUES (?,?,?,?,?,?,?)""",
-                (model, backend, prompt_version, SCHEMA_VERSION, cost_usd, notes, utc_now()))
+                    cost_usd, notes, created_at, source_id, transcript_id)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (model, backend, prompt_version, SCHEMA_VERSION, cost_usd, notes, utc_now(),
+                 source_id, transcript_id))
         return cur.lastrowid
+
+    def get_run(self, run_id: int) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM extraction_runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["stats"] = json.loads(out.pop("stats_json"))
+        return out
+
+    def find_run(self, source_id: int, transcript_id: int, prompt_version: str,
+                 backend: str | None, model: str | None) -> dict[str, Any] | None:
+        """Último run con la misma transcripción, prompt, backend y modelo (para reanudar)."""
+        row = self.db.execute(
+            """SELECT id FROM extraction_runs WHERE source_id=? AND transcript_id=?
+               AND prompt_version=? AND backend IS ? AND model IS ?
+               ORDER BY id DESC LIMIT 1""",
+            (source_id, transcript_id, prompt_version, backend, model)).fetchone()
+        return self.get_run(row["id"]) if row else None
+
+    def latest_run(self, source_id: int) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT id FROM extraction_runs WHERE source_id=? "
+                              "ORDER BY id DESC LIMIT 1", (source_id,)).fetchone()
+        return self.get_run(row["id"]) if row else None
+
+    def update_run(self, run_id: int, *, stats: dict[str, Any] | None = None,
+                   cost_usd: float | None = None) -> None:
+        with self.db:
+            if stats is not None:
+                self.db.execute("UPDATE extraction_runs SET stats_json=? WHERE id=?",
+                                (json.dumps(stats, ensure_ascii=False), run_id))
+            if cost_usd is not None:
+                self.db.execute("UPDATE extraction_runs SET cost_usd=? WHERE id=?",
+                                (cost_usd, run_id))
+
+    def supersede_previous_runs(self, source_id: int, run_id: int) -> int:
+        """Marca como `superseded` lo vigente de runs anteriores de la misma fuente.
+
+        El histórico se conserva, pero los agentes solo ven la extracción más reciente.
+        """
+        with self.db:
+            cur = self.db.execute(
+                """UPDATE claims SET status='superseded' WHERE source_id=? AND run_id IS NOT NULL
+                   AND run_id < ? AND status IN ('candidate', 'verified')""", (source_id, run_id))
+        return cur.rowcount
 
     def add_claim(self, claim: Claim) -> tuple[int, bool]:
         """Inserta la afirmación (siempre validada). Devuelve (id, creada)."""
@@ -392,6 +467,37 @@ class Store:
             cur = self.db.execute("UPDATE claims SET status=? WHERE id=?", (status, claim_id))
         if cur.rowcount == 0:
             raise KeyError(f"afirmación {claim_id} no existe")
+
+    def set_claim_grounding(self, claim_id: int, status: str, attrs: dict[str, Any],
+                            ts_start: float | None, ts_end: float | None) -> None:
+        """Resultado de la verificación: estado, motivo en attrs y anclaje temporal."""
+        if status not in CLAIM_STATUSES:
+            raise ValidationError(f"status no válido: {status!r}")
+        with self.db:
+            cur = self.db.execute(
+                "UPDATE claims SET status=?, attrs_json=?, ts_start=?, ts_end=? WHERE id=?",
+                (status, json.dumps(attrs, ensure_ascii=False), ts_start, ts_end, claim_id))
+        if cur.rowcount == 0:
+            raise KeyError(f"afirmación {claim_id} no existe")
+
+    def claims_for_source(self, source_id: int, *, run_id: int | None = None,
+                          status: str | None = None) -> list[dict[str, Any]]:
+        """Afirmaciones de una fuente en cualquier estado (revisión, no para agentes)."""
+        sql = ("SELECT c.*, e.canonical_name AS entity_name FROM claims c "
+               "LEFT JOIN entities e ON e.id = c.entity_id WHERE c.source_id = ?")
+        params: list[Any] = [source_id]
+        if run_id is not None:
+            sql += " AND c.run_id = ?"
+            params.append(run_id)
+        if status:
+            sql += " AND c.status = ?"
+            params.append(status)
+        out = []
+        for row in self.db.execute(sql + " ORDER BY c.ts_start IS NULL, c.ts_start, c.id", params):
+            item = dict(row)
+            item["attrs"] = json.loads(item.pop("attrs_json"))
+            out.append(item)
+        return out
 
     def add_implication(self, implication: Implication) -> int:
         implication.validate()

@@ -1,6 +1,6 @@
 # reZme · Fase 2 — Base de conocimiento universal para agentes de asignación de capital
 
-Estado: en curso (M0) · Revisado: 2026-10-01 (alcance universal + consumidores autónomos)
+Estado: M0 hecho · M1 implementado, pendiente de medir con el golden set · Revisado: 2026-10-01 (alcance universal + consumidores autónomos)
 
 ## 1. Qué cambia respecto a la primera propuesta
 
@@ -127,7 +127,7 @@ URL ─► Ingesta ─► Normalización ─► Extracción ─► Verificación
 
 | Hito | Contenido | Criterio de aceptación |
 |---|---|---|
-| **M0 · Cimientos** *(en curso)* | Paquete `rezme/`, esquema universal, almacén, ingesta que persiste cues crudos, CLI mínima, tests | Re-procesar una URL no vuelve a descargar; esquema valida; tests en CI sin dependencias nuevas |
+| **M0 · Cimientos** *(hecho)* | Paquete `rezme/`, esquema universal, almacén, ingesta que persiste cues crudos, CLI mínima, tests | Re-procesar una URL no vuelve a descargar; esquema valida; tests en CI sin dependencias nuevas |
 | **M1 · Extracción v1** | Claims + entidades + implicaciones por tramo con JSON validado; grounding | ≥95 % de registros con cita localizable en el golden set |
 | **M2 · Vídeos largos y entidades** | Fusión/deduplicado, catálogo de entidades, glosario ASR | Vídeo de 4 h → registros sin duplicados evidentes; alias resueltos |
 | **M3 · Vigencia y corroboración** | Caducidad, contradicciones, recuento de fuentes independientes, consulta point-in-time | Consulta «qué se sabía de X el día D» correcta |
@@ -147,3 +147,29 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   predeterminado hasta M1, donde se compara con la API por calidad y coste.
 - Derechos de autor: transcripciones solo en local (la base está en `.gitignore`);
   se exponen datos derivados y citas breves. Revisión legal si se productiza.
+
+## 8. Decisiones de M1
+
+- **Runs e idempotencia (esquema v2).** `extraction_runs` guarda `source_id`,
+  `transcript_id` y `stats_json` (estado por tramo, descartes con su motivo y
+  campos ignorados). Misma transcripción + prompt + backend + modelo = mismo run:
+  los tramos ya hechos no se repiten. `--force` o una versión nueva de prompt
+  crean otro run; al completarse, lo vigente de los runs anteriores pasa a
+  `superseded` (el histórico se conserva y los agentes no ven duplicados).
+- **Backends.** Se reutilizan los de `yt_digest` sustituyendo su prompt de
+  sistema durante la llamada. No devuelven consumo: `cost_usd` queda vacío.
+- **Anclaje temporal.** `ts_start`/`ts_end` salen del cue donde el verificador
+  localiza la cita, no del modelo. La cita va en el idioma original; el
+  `statement`, en español. Sin cita localizable (similitud < 0,85) o con una
+  cifra que no está en el tramo, la afirmación queda `ungrounded`.
+- **Cifras.** `metric_value` es el número tal como se dice; la escala va en
+  `metric_unit`. La normalización a valor absoluto queda para M2.
+- **Entidades.** Un nombre que coincide con varias entidades no se resuelve ni
+  con el tipo que proponga el modelo: `entity_id` vacío y candidatos en
+  `attrs.entidad`. Solo las afirmaciones verificadas pueden crear entidades.
+- **Implicaciones.** `stated_by_source` exige una cita propia localizable en el
+  tramo; si no, se degrada a `inferred_by_system`.
+- **Inyección.** La transcripción va delimitada como dato; de la respuesta solo
+  se leen los campos del esquema (lista blanca) y `attrs` admite solo pares
+  clave–valor simples.
+

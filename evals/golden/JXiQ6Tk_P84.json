@@ -1,0 +1,23 @@
+{
+  "video_id": "JXiQ6Tk_P84",
+  "url": "https://www.youtube.com/watch?v=JXiQ6Tk_P84",
+  "title": "Cybersecurity Explained: How the Industry Works—and How AI Is Rewriting It",
+  "channel": "Leo Cui, Ph.D., CFA",
+  "status": "borrador_sin_revisar",
+  "exhaustive": false,
+  "notes": "Redactado a partir del informe en prosa (Archivo/reZme-informe_Cybersecurity Explained..md), no de la transcripción. El vídeo es en inglés: las palabras clave llevan alternativas en ambos idiomas porque la cita va en el idioma original. Cifras y marcas de tiempo sin comprobar contra el vídeo.",
+  "claims": [
+    {"id": "cyber-01", "statement": "Modelos evaluados en entornos aislados escaparon a internet y afectaron a sistemas reales como Hugging Face.", "type": "fact", "keywords": ["hugging face"], "metric_value": null, "ts": "00:00:30"},
+    {"id": "cyber-02", "statement": "El gasto global en ciberseguridad ronda los 244 000 millones de dólares.", "type": "statistic", "keywords": [["gasto", "spending", "spend"]], "metric_value": 244, "metric_unit": "billion USD", "ts": "00:15:29"},
+    {"id": "cyber-03", "statement": "Comprar más herramientas de seguridad aumenta la complejidad y deja huecos entre controles.", "type": "causal_claim", "keywords": [["complejidad", "complexity"], ["herramientas", "productos", "tools", "products"]], "metric_value": null, "ts": "00:16:30"},
+    {"id": "cyber-04", "statement": "Palo Alto Networks refuerza su plataforma con CyberArk.", "type": "fact", "keywords": ["cyberark"], "metric_value": null, "ts": "00:22:15"},
+    {"id": "cyber-05", "statement": "Google refuerza su plataforma de seguridad con Wiz.", "type": "fact", "keywords": ["wiz"], "metric_value": null, "ts": "00:22:15"},
+    {"id": "cyber-06", "statement": "Cisco refuerza su plataforma de seguridad con Splunk.", "type": "fact", "keywords": ["splunk"], "metric_value": null, "ts": "00:22:15"},
+    {"id": "cyber-07", "statement": "La IA reduce la barrera de entrada de los atacantes sin cambiar la anatomía básica de la intrusión.", "type": "causal_claim", "keywords": [["barrera", "barrier"]], "metric_value": null, "ts": "00:25:55"},
+    {"id": "cyber-08", "statement": "Con ayuda de IA, Mozilla identificó 271 vulnerabilidades corregidas en Firefox 150.", "type": "fact", "keywords": [["firefox", "mozilla"], ["vulnerabilidades", "vulnerabilities"]], "metric_value": 271, "metric_unit": "vulnerabilidades", "ts": "00:31:04"},
+    {"id": "cyber-09", "statement": "Mozilla afrontó 423 errores en abril con más de 100 colaboradores.", "type": "fact", "keywords": [["abril", "april"]], "metric_value": 423, "metric_unit": "errores", "ts": "00:31:04"},
+    {"id": "cyber-10", "statement": "El cuello de botella pasa de encontrar fallos a validarlos, avisar y parchear.", "type": "causal_claim", "keywords": [["cuello de botella", "bottleneck"]], "metric_value": null, "ts": "00:31:04"},
+    {"id": "cyber-11", "statement": "Los agentes de IA son nuevos actores con identidad y permisos, vulnerables a la inyección indirecta.", "type": "risk", "keywords": [["inyeccion", "injection"]], "metric_value": null, "ts": "00:35:45"},
+    {"id": "cyber-12", "statement": "A corto plazo ganan las plataformas instaladas porque tienen datos, distribución y capacidad de bloqueo.", "type": "forecast", "keywords": [["plataforma*", "platform*"], ["corto plazo", "short term", "near term"]], "metric_value": null, "ts": "00:46:40"}
+  ]
+}
