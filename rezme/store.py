@@ -289,6 +289,18 @@ class Store:
     def get_source_by_id(self, source_id: int) -> dict[str, Any] | None:
         return _row(self.db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone())
 
+    def list_sources(self) -> list[dict[str, Any]]:
+        """Fuentes guardadas, la más reciente primero, con su transcripción y afirmaciones."""
+        return [dict(r) for r in self.db.execute(
+            """SELECT s.id, s.external_id, s.url, s.title, s.channel, s.published_at,
+                  t.n_cues, t.origin,
+                  (SELECT COUNT(*) FROM claims c
+                    WHERE c.source_id = s.id AND c.status = 'verified') AS verified
+               FROM sources s
+               LEFT JOIN transcripts t ON t.id = (
+                   SELECT MAX(id) FROM transcripts WHERE source_id = s.id)
+               ORDER BY s.id DESC""")]
+
     def save_transcript(self, source_id: int, cues: list[tuple[float, str]], origin: str,
                         language: str | None = None) -> tuple[int, bool]:
         """Guarda los cues crudos. Mismo contenido para la misma fuente = no-op."""

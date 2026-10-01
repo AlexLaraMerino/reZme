@@ -1,10 +1,19 @@
 # reZme
 
-**Menos vídeo. Más ideas.** Una aplicación para Mac que convierte vídeos de YouTube en un esquema, una tesis principal y sus momentos más valiosos.
+**Menos vídeo. Más ideas.** Una aplicación para Mac que convierte vídeos de YouTube en conocimiento consultable: guarda sus transcripciones en una base local y, de cada vídeo, puede darte un esquema, una tesis principal y sus momentos más valiosos.
 
 ![Interfaz de reZme](docs/interfaz.png)
 
-## Dos maneras de usarla
+## Qué hay en la app
+
+- **Cola:** pega una lista de reproducción o varias URLs y reZme guarda la transcripción de cada vídeo, uno a uno. Se puede pausar y continuar.
+- **Base de conocimiento:** los vídeos guardados, los recuentos de la base y un buscador de afirmaciones verificadas.
+- **Informe rápido:** el esquema, la tesis y los highlights de un solo vídeo, con las dos opciones de abajo.
+- **Ajustes:** clave de Meta (se guarda en el Llavero de macOS), sesión de YouTube, Whisper y ubicación de la base.
+
+La base es un fichero SQLite en `rezme_data/rezme.db`, dentro de la carpeta del proyecto. El diseño de la base está en [docs/FASE-2-extractor-inversion.md](docs/FASE-2-extractor-inversion.md).
+
+## Dos maneras de hacer un informe rápido
 
 - **Preparar prompt:** obtiene la transcripción y prepara las instrucciones para copiar a la IA que prefieras. No necesita clave API ni llama a Meta.
 - **Generar informe:** utiliza tu propia clave de Meta Model API y Muse Spark para entregar el informe directamente. El proveedor factura el consumo a tu cuenta.
@@ -54,24 +63,33 @@ Conserva la carpeta del proyecto: la app depende de `.venv` y del Python instala
 
 ## Uso
 
-1. Pega la URL de un vídeo de YouTube.
-2. Elige **Preparar prompt** o **Generar informe**.
-3. Para generar un informe, abre **Opciones** e introduce tu clave de Meta. El modelo inicial es `muse-spark-1.3`; puedes escribir otro identificador disponible en tu cuenta. Consulta la [documentación de Meta](https://github.com/meta-models/meta-model-cookbook).
+**Guardar una lista de vídeos**
+
+1. En **Cola**, pega la URL de una lista de reproducción o varias URLs, una por línea.
+2. Pulsa **Añadir y procesar**. Cada vídeo aparece con su estado; puedes pausar y continuar después.
+3. Los vídeos sin subtítulos quedan marcados. Para transcribirlos, activa Whisper y vuelve a procesar.
+4. En **Base de conocimiento** verás lo guardado.
+
+**Informe de un solo vídeo**
+
+1. En **Informe rápido**, pega la URL de un vídeo de YouTube.
+2. Elige **Preparar prompt** o **Informe con Muse Spark**.
+3. Para el informe, introduce antes tu clave de Meta en **Ajustes**. El modelo inicial es `muse-spark-1.3`; puedes escribir otro identificador disponible en tu cuenta. Consulta la [documentación de Meta](https://github.com/meta-models/meta-model-cookbook).
 4. Pulsa el botón principal y espera el resultado. Puedes cancelar el proceso.
 5. Copia el texto o guárdalo antes de cerrar la app.
 
-La aplicación busca subtítulos en español o inglés. Cuando no los encuentra, intenta descargar y transcribir el audio localmente con Whisper. **La primera transcripción descarga el modelo y puede tardar varios minutos**; las siguientes reutilizan ese modelo.
+La aplicación busca subtítulos en español o inglés. En el informe rápido, cuando no los encuentra, transcribe el audio localmente con Whisper. **La primera transcripción descarga el modelo y puede tardar varios minutos**; las siguientes reutilizan ese modelo.
 
-En **Opciones** puedes seleccionar la sesión de Chrome, Firefox o Safari si YouTube solicita iniciar sesión. macOS puede pedir permiso para acceder a los datos del navegador. También puedes pegar una transcripción: en ese caso se utiliza ese texto sin descargar el vídeo, manteniendo la URL como fuente.
+En **Ajustes** puedes seleccionar la sesión de Chrome, Firefox o Safari si YouTube solicita iniciar sesión. macOS puede pedir permiso para acceder a los datos del navegador. En el informe rápido también puedes pegar una transcripción: en ese caso se utiliza ese texto sin descargar el vídeo, manteniendo la URL como fuente.
 
 ## Datos y privacidad
 
 - No hay cuentas propias de reZme, analítica, telemetría ni un servidor del proyecto.
-- La clave API permanece en memoria durante la sesión; no se guarda en archivos ni se añade a los argumentos del proceso.
+- La clave API se guarda en el Llavero de macOS; no se escribe en archivos ni se añade a los argumentos del proceso. Puedes borrarla con **Olvidar** en Ajustes.
 - En modo API se envía la transcripción o sus notas, metadatos e instrucciones a **Meta**. Se aplican las condiciones de tu proveedor y cuenta.
 - Para obtener contenido se contacta con YouTube. La primera descarga del modelo local contacta con el repositorio del modelo en Hugging Face.
 - Los archivos temporales se eliminan al terminar normalmente. Una interrupción abrupta puede dejar temporales del sistema. El modelo de Whisper queda en la caché local.
-- No hay historial automático: guarda los informes que quieras conservar.
+- La cola guarda las transcripciones en una base local (`rezme_data/rezme.db`), que no sale de tu Mac ni se sube al repositorio. Los informes rápidos no se guardan: copia o guarda los que quieras conservar.
 
 ## Limitaciones conocidas
 
@@ -94,6 +112,7 @@ En **Opciones** puedes seleccionar la sesión de Chrome, Firefox o Safari si You
 | --- | --- |
 | `desktop/ReZme.swift` | Interfaz nativa de macOS |
 | `desktop/worker.py` | Comunicación con la interfaz y API de Meta |
+| `rezme/` | Base de conocimiento: ingesta, cola, extracción y verificación |
 | `yt_digest.py` | Subtítulos, transcripción, prompts y modos de terminal |
 | `desktop/build.py` | Compilación local de la app y su icono |
 | `requirements-desktop.txt` | Versiones directas probadas para la app |

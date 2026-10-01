@@ -116,7 +116,8 @@ def emit_queue(store):
     count = lambda state: sum(1 for job in jobs if job["state"] == state)
     summary = (f"{count('saved')} guardados · {count('pending') + count('running')} en cola · "
                f"{count('failed')} fallidos · {count('skipped')} sin subtítulos") if jobs else ""
-    emit("queue", jobs=jobs, summary=summary)
+    emit("queue", jobs=jobs, summary=summary,
+         counts={state: count(state) for state in ("saved", "pending", "running", "failed", "skipped")})
 
 
 def run_queue(options):
@@ -164,6 +165,44 @@ def run_queue(options):
         emit_queue(store)
 
 
+def run_library(options):
+    """Lo que hay en la base: recuentos, vídeos guardados y búsqueda de afirmaciones verificadas."""
+    from rezme import Store
+    from rezme.batch import ORIGIN_LABELS
+
+    if not options.get("db"):
+        raise ValueError("No se encuentra la base de datos de reZme.")
+    with Store(options["db"]) as store:
+        stats = store.stats()
+        by_status = stats["claims_by_status"]
+        sources = []
+        for row in store.list_sources():
+            if row["n_cues"] is None:
+                continue
+            frases = f"{row['n_cues']:,}".replace(",", ".")
+            sources.append({
+                "id": row["id"], "title": row["title"] or row["external_id"],
+                "channel": row["channel"] or "", "date": row["published_at"] or "",
+                "detail": f"{frases} frases · {ORIGIN_LABELS.get(row['origin'], row['origin'])}",
+                "verified": row["verified"], "url": row["url"] or ""})
+        emit("library", sources=sources, stats={
+            "videos": len(sources), "verified": by_status.get("verified", 0),
+            "ungrounded": by_status.get("ungrounded", 0), "entities": stats["entities"]})
+        query = options.get("query", "").strip()
+        if query:
+            titles = {row["id"]: row["title"] for row in store.list_sources()}
+            try:
+                rows = store.search_claims(query, limit=40)
+            except ValueError:
+                rows = []
+            emit("hits", items=[{
+                "id": row["id"], "statement": row["statement"],
+                "meta": " · ".join(part for part in (
+                    row["type"], row["entity_name"], titles.get(row["source_id"]),
+                    digest.hms(row["ts_start"]) if row["ts_start"] is not None else None) if part),
+            } for row in rows])
+
+
 def _terminate(*_):
     raise KeyboardInterrupt  # Cancelar desde la app: la cola deja el vídeo en curso limpio.
 
@@ -175,6 +214,8 @@ if __name__ == "__main__":
         options = json.load(sys.stdin)
         if options.get("mode") == "queue":
             run_queue(options)
+        elif options.get("mode") == "library":
+            run_library(options)
         else:
             run(options)
     except Exception as error:

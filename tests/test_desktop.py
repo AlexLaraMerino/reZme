@@ -110,13 +110,39 @@ class DesktopTests(unittest.TestCase):
         import os, tempfile
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "rezme.db")
-            self.assertEqual(self.queue(db, action="status"), [{"type": "queue", "jobs": [], "summary": ""}])
+            empty = self.queue(db, action="status")[0]
+            self.assertEqual((empty["jobs"], empty["summary"], empty["counts"]["pending"]), ([], "", 0))
             with self.assertRaisesRegex(ValueError, "URL válida"):
                 self.queue(db, action="run", urls="https://example.com/x")
             with self.assertRaises(ValueError):
                 self.queue(db, action="borrar")
         with self.assertRaises(ValueError):
             self.queue("", action="status")
+
+    def test_library_lists_saved_videos_and_searches_verified_claims(self):
+        import os, tempfile
+        from rezme import Claim, Store
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "rezme.db")
+            with Store(db) as store:
+                src, _ = store.add_source("youtube", "aaaaaaaaaa1", title="Macro 2027", channel="Canal",
+                                          published_at="2026-09-01")
+                store.save_transcript(src, [(float(i), "x") for i in range(1200)], "subtitles_auto")
+                store.add_source("youtube", "bbbbbbbbbb2", title="Sin transcripción")
+                entity = store.upsert_entity("macro_indicator", "IPC")
+                store.add_claim(Claim(source_id=src, statement="La inflación subyacente baja al 2,4 %.",
+                                      type="statistic", status="verified", entity_id=entity, ts_start=75))
+                store.add_claim(Claim(source_id=src, statement="La inflación se dispara.", type="opinion",
+                                      status="ungrounded"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                worker.run_library({"db": db, "query": "inflacion"})
+            library, hits = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(library["stats"], {"videos": 1, "verified": 1, "ungrounded": 1, "entities": 1})
+        self.assertEqual(library["sources"][0]["detail"], "1.200 frases · subtítulos automáticos")
+        self.assertEqual((library["sources"][0]["title"], library["sources"][0]["verified"]), ("Macro 2027", 1))
+        self.assertEqual([h["statement"] for h in hits["items"]], ["La inflación subyacente baja al 2,4 %."])
+        self.assertEqual(hits["items"][0]["meta"], "statistic · IPC · Macro 2027 · 00:01:15")
 
 
 if __name__ == "__main__":
