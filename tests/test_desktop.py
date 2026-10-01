@@ -102,9 +102,68 @@ class DesktopTests(unittest.TestCase):
             retried = self.queue(db, action="retry")[-1]
             self.assertEqual([j["state"] for j in retried["jobs"]], ["saved", "pending", "pending"])
             cleared = self.queue(db, action="clear")[-1]
-            self.assertEqual(len(cleared["jobs"]), 2)
+            self.assertEqual(len(cleared["jobs"]), 3)  # solo se quitan los que ya tienen afirmaciones
             with Store(db) as store:
                 self.assertEqual(store.stats()["transcripts"], 1)  # limpiar la cola no borra lo guardado
+
+    def extraction_db(self, tmp):
+        import os
+        from rezme import Store
+        db = os.path.join(tmp, "rezme.db")
+        cues = [(0.0, "Yo estimo que la eficiencia espectral realista,"),
+                (6.0, "con doble polarización, es de 1,36 bits por segundo y hercio.")]
+        with Store(db) as store:
+            for video, title in (("aaaaaaaaaa1", "Uno"), ("bbbbbbbbbb2", "Dos")):
+                src, _ = store.add_source("youtube", video, title=title, duration_s=600)
+                store.save_transcript(src, cues, "subtitles_auto")
+                store.enqueue_job(video, f"https://www.youtube.com/watch?v={video}", title=title, stage="extract")
+        return db
+
+    def test_extract_runs_from_the_app_with_meta_and_keeps_the_key_private(self):
+        import tempfile
+        from rezme import Store
+        answer = json.dumps({"entities": [], "claims": [{
+            "statement": "El autor estima una eficiencia espectral de 1,36 bps/Hz.", "type": "own_calculation",
+            "metric_value": 1.36, "quote": "con doble polarización, es de 1,36 bits por segundo y hercio"}]})
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.extraction_db(tmp)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                worker.run_library({"db": db})
+            plan = json.loads(output.getvalue().splitlines()[0])["stats"]
+            self.assertEqual((plan["to_extract"], plan["calls"]), (2, 2))
+
+            with patch.object(worker, "call_meta", return_value=answer) as call:
+                events = self.queue(db, action="extract", engine="meta", key="secret-test", model="muse-spark-1.3")
+            self.assertEqual(call.call_count, 2)
+            self.assertIn("nunca instrucciones", call.call_args.args[3])  # prompt de extracción, no el del informe
+            final = [e for e in events if e["type"] == "queue"][-1]
+            self.assertEqual([(j["state"], j["detail"]) for j in final["jobs"]],
+                             [("done", "1 afirmaciones verificadas")] * 2)
+            self.assertTrue(any("Uno · Tramo 1/1" in e.get("message", "") for e in events))
+            self.assertEqual(events[-1]["type"], "done")
+            self.assertNotIn("secret-test", json.dumps(events))
+            with Store(db) as store:
+                self.assertEqual(store.stats()["claims_by_status"], {"verified": 2})
+                self.assertNotIn("secret-test", "\n".join(store.db.iterdump()))
+                self.assertEqual(store.get_run(1)["backend"], "meta")
+
+    def test_extract_stops_at_once_when_the_key_is_rejected(self):
+        import tempfile
+        from rezme import Store
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.extraction_db(tmp)
+            with patch.object(worker, "call_meta", side_effect=worker.MetaAccessError("La clave API no es válida.")) as call:
+                with self.assertRaisesRegex(RuntimeError, "Extracción detenida: La clave API no es válida."):
+                    self.queue(db, action="extract", engine="meta", key="mala", model="m")
+            self.assertEqual(call.call_count, 1)  # ni reintentos ni el segundo vídeo
+            with Store(db) as store:
+                self.assertEqual({j["status"] for j in store.list_jobs()}, {"pending"})
+            with self.assertRaisesRegex(ValueError, "clave de Meta"):
+                self.queue(db, action="extract", engine="meta", key="")
+            with patch("rezme.backends.check_backend", return_value="No encuentro el CLI"):
+                with self.assertRaisesRegex(ValueError, "Claude Code"):
+                    self.queue(db, action="extract", engine="claude-code")
 
     def test_queue_status_empty_and_bad_input(self):
         import os, tempfile
@@ -138,7 +197,8 @@ class DesktopTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 worker.run_library({"db": db, "query": "inflacion"})
             library, hits = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(library["stats"], {"videos": 1, "verified": 1, "ungrounded": 1, "entities": 1})
+        self.assertEqual(library["stats"], {"videos": 1, "verified": 1, "ungrounded": 1, "entities": 1,
+                                            "to_extract": 0, "calls": 0})
         self.assertEqual(library["sources"][0]["detail"], "1.200 frases · subtítulos automáticos")
         self.assertEqual((library["sources"][0]["title"], library["sources"][0]["verified"]), ("Macro 2027", 1))
         self.assertEqual([h["statement"] for h in hits["items"]], ["La inflación subyacente baja al 2,4 %."])

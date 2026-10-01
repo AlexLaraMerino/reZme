@@ -7,9 +7,9 @@
 ## Qué hay en la app
 
 - **Cola:** pega una lista de reproducción o varias URLs y reZme guarda la transcripción de cada vídeo, uno a uno. Se puede pausar y continuar.
-- **Base de conocimiento:** los vídeos guardados, los recuentos de la base y un buscador de afirmaciones verificadas.
+- **Base de conocimiento:** los vídeos guardados, el botón para extraer sus afirmaciones con un modelo, los recuentos de la base y un buscador de afirmaciones verificadas.
 - **Informe rápido:** el esquema, la tesis y los highlights de un solo vídeo, con las dos opciones de abajo.
-- **Ajustes:** clave de Meta (se guarda en el Llavero de macOS), sesión de YouTube, Whisper y ubicación de la base.
+- **Ajustes:** clave de Meta (se guarda en el Llavero de macOS), motor de extracción (Muse Spark o Claude Code), sesión de YouTube, Whisper y ubicación de la base.
 
 La base es un fichero SQLite en `rezme_data/rezme.db`, dentro de la carpeta del proyecto. El diseño de la base está en [docs/FASE-2-extractor-inversion.md](docs/FASE-2-extractor-inversion.md).
 
@@ -68,7 +68,7 @@ Conserva la carpeta del proyecto: la app depende de `.venv` y del Python instala
 1. En **Cola**, pega la URL de una lista de reproducción o varias URLs, una por línea.
 2. Pulsa **Añadir y procesar**. Cada vídeo aparece con su estado; puedes pausar y continuar después.
 3. Los vídeos sin subtítulos quedan marcados. Para transcribirlos, activa Whisper y vuelve a procesar.
-4. En **Base de conocimiento** verás lo guardado.
+4. En **Base de conocimiento** verás lo guardado. Pulsa **Extraer afirmaciones** para que el modelo elegido en Ajustes lea cada transcripción; solo se conservan como verificadas las afirmaciones cuya cita y cifras aparecen en el texto. La app indica antes cuántas llamadas al modelo hará. Se puede pausar y continuar.
 
 **Informe de un solo vídeo**
 
@@ -78,7 +78,7 @@ Conserva la carpeta del proyecto: la app depende de `.venv` y del Python instala
 4. Pulsa el botón principal y espera el resultado. Puedes cancelar el proceso.
 5. Copia el texto o guárdalo antes de cerrar la app.
 
-La aplicación busca subtítulos en español o inglés. En el informe rápido, cuando no los encuentra, transcribe el audio localmente con Whisper. **La primera transcripción descarga el modelo y puede tardar varios minutos**; las siguientes reutilizan ese modelo.
+La cola usa los subtítulos manuales en español o inglés y, si no los hay, los automáticos en el idioma original del vídeo (las traducciones automáticas son peores y YouTube las limita). En el informe rápido, cuando no los encuentra, transcribe el audio localmente con Whisper. **La primera transcripción descarga el modelo y puede tardar varios minutos**; las siguientes reutilizan ese modelo.
 
 En **Ajustes** puedes seleccionar la sesión de Chrome, Firefox o Safari si YouTube solicita iniciar sesión. macOS puede pedir permiso para acceder a los datos del navegador. En el informe rápido también puedes pegar una transcripción: en ese caso se utiliza ese texto sin descargar el vídeo, manteniendo la URL como fuente.
 
@@ -86,7 +86,7 @@ En **Ajustes** puedes seleccionar la sesión de Chrome, Firefox o Safari si YouT
 
 - No hay cuentas propias de reZme, analítica, telemetría ni un servidor del proyecto.
 - La clave API se guarda en el Llavero de macOS; no se escribe en archivos ni se añade a los argumentos del proceso. Puedes borrarla con **Olvidar** en Ajustes.
-- En modo API se envía la transcripción o sus notas, metadatos e instrucciones a **Meta**. Se aplican las condiciones de tu proveedor y cuenta.
+- En el informe con Muse Spark y en la extracción con Muse Spark se envía la transcripción o sus notas, metadatos e instrucciones a **Meta**; con el motor Claude Code, a **Anthropic** a través del CLI `claude`. Se aplican las condiciones de tu proveedor y cuenta.
 - Para obtener contenido se contacta con YouTube. La primera descarga del modelo local contacta con el repositorio del modelo en Hugging Face.
 - Los archivos temporales se eliminan al terminar normalmente. Una interrupción abrupta puede dejar temporales del sistema. El modelo de Whisper queda en la caché local.
 - La cola guarda las transcripciones en una base local (`rezme_data/rezme.db`), que no sale de tu Mac ni se sube al repositorio. Los informes rápidos no se guardan: copia o guarda los que quieras conservar.

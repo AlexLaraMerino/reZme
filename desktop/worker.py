@@ -28,11 +28,15 @@ def validate_url(url):
     return url
 
 
-def call_meta(prompt, key, model):
+class MetaAccessError(RuntimeError):
+    """Meta rechaza la petición por clave, permisos, modelo o saldo: reintentar no lo arregla."""
+
+
+def call_meta(prompt, key, model, system=None):
     request = urllib.request.Request(
         "https://api.meta.ai/v1/chat/completions",
         data=json.dumps({"model": model, "messages": [
-            {"role": "system", "content": digest.SYSTEM},
+            {"role": "system", "content": system or digest.SYSTEM},
             {"role": "user", "content": prompt},
         ], "max_completion_tokens": 12000}).encode(),
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
@@ -44,7 +48,9 @@ def call_meta(prompt, key, model):
         messages = {401: "La clave API no es válida.", 403: "Tu cuenta no tiene acceso a este modelo.",
                     404: "No se encuentra el modelo. Revisa su nombre en los ajustes.",
                     429: "Meta ha alcanzado el límite de uso o saldo de tu cuenta. Inténtalo más tarde."}
-        raise RuntimeError(messages.get(error.code, f"Meta devolvió un error ({error.code}). Inténtalo más tarde.")) from None
+        if error.code in messages:
+            raise MetaAccessError(messages[error.code]) from None
+        raise RuntimeError(f"Meta devolvió un error ({error.code}). Inténtalo más tarde.") from None
     choice = data["choices"][0]
     if choice.get("finish_reason") == "length":
         raise RuntimeError("Meta alcanzó el límite de respuesta. No se ha guardado un informe incompleto; prueba el modo prompt.")
@@ -96,49 +102,96 @@ def run(options):
     emit("result", text=body, title=meta["title"])
 
 
-def _job_view(job):
+def _job_view(job, verified):
     status, stage = job["status"], job["stage"]
     if status == "pending":
-        state, detail = ("saved", "Transcripción guardada") if stage == "extract" else ("pending", "En cola")
+        state, detail = ("saved", "Transcripción guardada · sin afirmaciones") if stage == "extract" else ("pending", "En cola")
     elif status == "running":
-        state, detail = "running", "Procesando…"
+        state, detail = "running", "Extrayendo afirmaciones…" if stage == "extract" else "Guardando la transcripción…"
     elif status == "done":
-        state, detail = "saved", "Transcripción y extracción guardadas"
+        n = verified.get(job["video_id"], 0)
+        state, detail = "done", f"{n} afirmaciones verificadas"
     elif status == "failed":
-        state, detail = "failed", job["last_error"] or "No se pudo procesar."
+        prefix = "Extracción: " if stage == "extract" else ""
+        state, detail = "failed", prefix + (job["last_error"] or "No se pudo procesar.")
     else:
         state, detail = "skipped", job["notes"] or "Saltado"
     return {"id": job["id"], "title": job["title"] or job["video_id"], "state": state, "detail": detail}
 
 
 def emit_queue(store):
-    jobs = [_job_view(job) for job in store.list_jobs()]
+    verified = {row["external_id"]: row["verified"] for row in store.list_sources()}
+    jobs = [_job_view(job, verified) for job in store.list_jobs()]
     count = lambda state: sum(1 for job in jobs if job["state"] == state)
-    summary = (f"{count('saved')} guardados · {count('pending') + count('running')} en cola · "
+    summary = (f"{count('saved') + count('done')} guardados · {count('pending') + count('running')} en cola · "
                f"{count('failed')} fallidos · {count('skipped')} sin subtítulos") if jobs else ""
     emit("queue", jobs=jobs, summary=summary,
-         counts={state: count(state) for state in ("saved", "pending", "running", "failed", "skipped")})
+         counts={state: count(state) for state in ("saved", "done", "pending", "running", "failed", "skipped")})
+
+
+def extraction_backend(options):
+    """Modelo que extrae las afirmaciones: Muse Spark (clave de Meta) o el CLI de Claude Code."""
+    from rezme import backends
+
+    engine = options.get("engine") or "meta"
+    if engine == "meta":
+        key, model = options.get("key", "").strip(), options.get("model") or "muse-spark-1.3"
+        if not key:
+            raise ValueError("Introduce tu clave de Meta en los ajustes.")
+
+        def call(system, user):
+            try:
+                return call_meta(user, key, model, system)
+            except MetaAccessError as error:
+                raise backends.BackendUnavailable(str(error)) from None
+        return backends.Backend("meta", model, call)
+    if engine == "claude-code":
+        problem = backends.check_backend("claude-code")
+        if problem:
+            raise ValueError("No encuentro Claude Code en este Mac. Elige Muse Spark en los ajustes o instala el CLI `claude`.")
+        return backends.make_backend("claude-code")
+    raise ValueError("Motor de extracción no válido.")
 
 
 def run_queue(options):
-    """Cola de lotes para la app: añade URLs o listas y guarda las transcripciones una a una."""
+    """Cola de lotes para la app: guarda transcripciones y extrae afirmaciones, vídeo a vídeo."""
     from rezme import Store, batch
 
     action = options.get("action", "status")
-    if action not in ("status", "run", "retry", "clear"):
+    if action not in ("status", "run", "extract", "retry", "clear"):
         raise ValueError("Acción de cola no válida.")
     if not options.get("db"):
         raise ValueError("No se encuentra la base de datos de reZme.")
     cookies = options.get("browser") or None
     whisper = bool(options.get("whisper"))
+    progress = lambda message: emit("progress", message=message)
     with Store(options["db"]) as store:
         if action == "retry":
             store.retry_jobs(status="failed")
             store.retry_jobs(status="skipped")
         elif action == "clear":
-            for job in store.list_jobs():
-                if job["status"] == "done" or (job["status"] == "pending" and job["stage"] == "extract"):
-                    store.remove_job(job["id"])
+            store.clear_done_jobs()
+        elif action == "extract":
+            from rezme import extract
+            backend = extraction_backend(options)
+
+            def extractor(target, source_id):
+                title = (target.get_source_by_id(source_id) or {}).get("title") or "Vídeo"
+                return extract.extract_source(
+                    target, source_id, backend,
+                    progress=lambda message: progress(f"{title} · {message.strip().rstrip('…')}"))
+
+            deps = batch.Deps()
+            deps.extractor = extractor
+            store.recover_running_jobs()
+            emit_queue(store)
+            summary = batch.run_queue(store, stage="extract", delay=0, deps=deps, out=progress,
+                                      on_change=lambda: emit_queue(store))
+            emit_queue(store)
+            if summary.stopped:
+                raise RuntimeError(f"Extracción detenida: {summary.stopped}")
+            emit("done", message=batch.format_summary(summary))
+            return
         elif action == "run":
             urls = batch.read_urls(options.get("urls", "").splitlines())
             if urls:
@@ -156,8 +209,7 @@ def run_queue(options):
             store.recover_running_jobs()
             emit_queue(store)
             summary = batch.run_queue(
-                store, no_whisper=not whisper, cookies_from=cookies,
-                out=lambda message: emit("progress", message=message),
+                store, no_whisper=not whisper, cookies_from=cookies, out=progress,
                 on_change=lambda: emit_queue(store))
             emit_queue(store)
             emit("done", message=batch.format_summary(summary))
@@ -185,9 +237,20 @@ def run_library(options):
                 "channel": row["channel"] or "", "date": row["published_at"] or "",
                 "detail": f"{frases} frases · {ORIGIN_LABELS.get(row['origin'], row['origin'])}",
                 "verified": row["verified"], "url": row["url"] or ""})
+        # Lo que falta por extraer: vídeos con transcripción y sin afirmaciones, y llamadas estimadas.
+        from rezme.chunking import chunk_transcript
+        waiting = store.pending_jobs(stages=("extract",))
+        calls = 0
+        for job in waiting:
+            source = store.get_source("youtube", job["video_id"])
+            transcript = store.latest_transcript(source["id"]) if source else None
+            if transcript:
+                chapters = json.loads(source["chapters_json"]) if source.get("chapters_json") else None
+                calls += len(chunk_transcript(transcript["cues"], chapters, source.get("duration_s")))
         emit("library", sources=sources, stats={
             "videos": len(sources), "verified": by_status.get("verified", 0),
-            "ungrounded": by_status.get("ungrounded", 0), "entities": stats["entities"]})
+            "ungrounded": by_status.get("ungrounded", 0), "entities": stats["entities"],
+            "to_extract": len(waiting), "calls": calls})
         query = options.get("query", "").strip()
         if query:
             titles = {row["id"]: row["title"] for row in store.list_sources()}

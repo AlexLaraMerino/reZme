@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import prompts
-from .backends import Backend
+from .backends import Backend, BackendUnavailable
 from .chunking import Chunk, chunk_transcript, hms, render
 from .schema import (
     ENTITY_TYPES, Claim, Entity, Implication, ValidationError, normalize_name, parse_ts,
@@ -411,6 +411,8 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
         try:
             user = build_user_prompt(source, chunk, len(chunks), prompt_version)
             parsed, calls = extract_chunk(backend.call, system, user, source_id, prompt_version)
+        except BackendUnavailable:
+            raise  # sin acceso al modelo no tiene sentido seguir con más tramos
         except Exception as exc:  # fallo del backend: se anota y se puede reanudar
             entry.update(estado="error", error=str(exc))
             stats["tramos"][str(chunk.index)] = entry

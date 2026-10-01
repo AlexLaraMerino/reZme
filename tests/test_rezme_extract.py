@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import yt_digest
@@ -595,8 +596,7 @@ class BackendTests(unittest.TestCase):
             seen["system"], seen["user"], seen["rest"] = yt_digest.SYSTEM, user, rest
             return "{}"
 
-        for name, attr in (("claude-code", "run_claude_code"), ("api", "run_api"),
-                           ("ollama", "run_ollama")):
+        for name, attr in (("api", "run_api"), ("ollama", "run_ollama")):
             with mock.patch.object(yt_digest, attr, fake):
                 backend = bk.make_backend(name, ollama_model="modelo-local")
                 self.assertEqual(backend.call("SISTEMA JSON", "hola"), "{}")
@@ -607,10 +607,36 @@ class BackendTests(unittest.TestCase):
 
     def test_system_prompt_is_restored_after_failure(self):
         original = yt_digest.SYSTEM
-        with mock.patch.object(yt_digest, "run_claude_code", side_effect=RuntimeError("x")):
+        with mock.patch.object(yt_digest, "run_api", side_effect=RuntimeError("x")):
             with self.assertRaises(RuntimeError):
-                bk.make_backend().call("otro", "hola")
+                bk.make_backend("api").call("otro", "hola")
         self.assertEqual(yt_digest.SYSTEM, original)
+
+    def test_claude_code_runs_without_tools_and_records_cost(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            out = json.dumps({"result": ' {"claims": []} ', "total_cost_usd": 0.02, "is_error": False})
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+        with mock.patch.object(bk.subprocess, "run", fake_run):
+            backend = bk.make_backend("claude-code")
+            self.assertEqual(backend.call("SISTEMA", "transcripción"), '{"claims": []}')
+            backend.call("SISTEMA", "otra")
+        cmd, kwargs = calls[0]
+        self.assertEqual(cmd[:4], ["claude", "-p", "--system-prompt", "SISTEMA"])
+        self.assertNotIn("--bare", cmd)  # --bare ignora la sesión iniciada en el CLI
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")  # sin herramientas
+        self.assertEqual(kwargs["input"], "transcripción")
+        self.assertAlmostEqual(backend.cost_usd, 0.04)
+
+        failing = [SimpleNamespace(returncode=1, stdout="", stderr="no auth"),
+                   SimpleNamespace(returncode=0, stdout=json.dumps({"is_error": True, "result": "límite"}), stderr="")]
+        with mock.patch.object(bk.subprocess, "run", lambda *a, **k: failing.pop(0)):
+            for expected in ("claude falló", "devolvió un error"):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    bk.make_backend("claude-code").call("s", "u")
 
     def test_unknown_backend_and_missing_requirements(self):
         with self.assertRaisesRegex(ValueError, "Backend no válido"):

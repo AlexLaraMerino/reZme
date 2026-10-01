@@ -187,4 +187,13 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
 - `--no-whisper` deja los vídeos sin subtítulos como `skipped`;
   `--whisper-only` los recupera.
 - La cola no guarda secretos: ni el navegador de las cookies ni parámetros de URL.
+- La extracción también se lanza desde la app (Base de conocimiento → «Extraer
+  afirmaciones»), con Muse Spark o con el CLI de Claude Code. Si el modelo
+  rechaza las credenciales o el saldo, el lote se detiene al momento.
+- Subtítulos: manuales en los idiomas pedidos; si no, automáticos en el idioma
+  original. Las traducciones automáticas (`tlang`) son el último recurso porque
+  YouTube las limita con errores 429. Si una pista no se descarga tras tres
+  intentos, se transcribe con Whisper cuando está permitido.
+- El backend `claude-code` llama al CLI sin `--bare` (que ignora la sesión
+  iniciada), sin herramientas y con salida JSON para registrar el coste.
 

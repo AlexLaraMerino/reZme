@@ -93,6 +93,9 @@ final class AppModel: ObservableObject {
     @Published var model: String { didSet { defaults.set(model, forKey: "model") } }
     @Published var browser: String { didSet { defaults.set(browser, forKey: "browser") } }
     @Published var whisper: Bool { didSet { defaults.set(whisper, forKey: "whisper") } }
+    /// Modelo que extrae las afirmaciones: "meta" (Muse Spark) o "claude-code".
+    @Published var engine: String { didSet { defaults.set(engine, forKey: "engine") } }
+    @Published var confirmExtract = false
 
     private var process: Process?
     private var generation = UUID()
@@ -103,11 +106,15 @@ final class AppModel: ObservableObject {
         model = defaults.string(forKey: "model") ?? "muse-spark-1.3"
         browser = defaults.string(forKey: "browser") ?? ""
         whisper = defaults.bool(forKey: "whisper")
+        engine = defaults.string(forKey: "engine") ?? "meta"
     }
 
     var root: URL { Bundle.main.bundleURL.resolvingSymlinksInPath().deletingLastPathComponent() }
     var database: URL { root.appendingPathComponent("rezme_data/rezme.db") }
     var waiting: Int { (counts["pending"] ?? 0) + (counts["running"] ?? 0) }
+    var saved: Int { (counts["saved"] ?? 0) + (counts["done"] ?? 0) }
+    var toExtract: Int { stats["to_extract"] ?? 0 }
+    var engineName: String { engine == "meta" ? "Muse Spark" : "Claude Code" }
 
     private func fail(_ message: String) { error = true; status = message }
 
@@ -128,7 +135,8 @@ final class AppModel: ObservableObject {
         task.executableURL = runtime
         task.arguments = [resources.appendingPathComponent("worker.py").path]
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        env["PATH"] = "\(home)/.npm-global/bin:\(home)/.local/bin:\(home)/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         env["PYTHONUNBUFFERED"] = "1"
         task.environment = env
         let input = Pipe(), result = Pipe()
@@ -177,8 +185,8 @@ final class AppModel: ObservableObject {
     func cancel() {
         let owner = busy
         generation = UUID(); process?.terminate(); process = nil; busy = nil; error = false
-        if owner == .queue {
-            status = "Cola en pausa. Lo ya guardado se conserva."
+        if owner == .queue || owner == .library {
+            status = owner == .queue ? "Cola en pausa. Lo ya guardado se conserva." : "Extracción en pausa. Continuará donde lo dejó."
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.queue("status"); self.loadLibrary() }
         } else {
             status = "Análisis cancelado."
@@ -197,26 +205,60 @@ final class AppModel: ObservableObject {
         launch(["mode": "queue", "action": action, "urls": queueText, "browser": browser,
                 "whisper": whisper ? "1" : "", "db": database.path],
                owner: tracked ? .queue : nil,
-               onEvent: { event in
-                   switch event["type"] as? String {
-                   case "progress", "done": self.status = event["message"] as? String ?? ""
-                   case "queue":
-                       self.counts = event["counts"] as? [String: Int] ?? [:]
-                       self.jobs = (event["jobs"] as? [[String: Any]] ?? []).compactMap { job in
-                           guard let id = job["id"] as? Int else { return nil }
-                           return QueueJob(id: id, title: job["title"] as? String ?? "",
-                                           state: job["state"] as? String ?? "", detail: job["detail"] as? String ?? "")
-                       }
-                   case "error": self.fail(event["message"] as? String ?? "No se pudo procesar la cola.")
-                   default: break
-                   }
-               },
+               onEvent: { event in self.queueEvent(event) },
                onExit: { ok in
                    guard tracked else { return }
                    if ok && !self.error { self.queueText = "" }
                    else if !ok && !self.error { self.fail("El proceso se ha interrumpido. Vuelve a lanzarlo: continuará donde lo dejó.") }
                    self.loadLibrary()
                })
+    }
+
+    private func queueEvent(_ event: [String: Any]) {
+        switch event["type"] as? String {
+        case "progress", "done": status = event["message"] as? String ?? ""
+        case "queue":
+            counts = event["counts"] as? [String: Int] ?? [:]
+            jobs = (event["jobs"] as? [[String: Any]] ?? []).compactMap { job in
+                guard let id = job["id"] as? Int else { return nil }
+                return QueueJob(id: id, title: job["title"] as? String ?? "",
+                                state: job["state"] as? String ?? "", detail: job["detail"] as? String ?? "")
+            }
+        case "error": fail(event["message"] as? String ?? "No se pudo procesar la cola.")
+        default: break
+        }
+    }
+
+    // MARK: Extracción de afirmaciones
+
+    /// Pide confirmación antes de gastar llamadas al modelo.
+    func askExtract() {
+        guard busy == nil else { status = "Hay una tarea en curso. Espera a que termine o páusala."; error = true; return }
+        if engine == "meta" {
+            loadKey()
+            if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                pane = .settings; fail("Introduce tu clave de Meta en los ajustes, o elige Claude Code como motor."); return
+            }
+        }
+        confirmExtract = true
+    }
+
+    func extract() {
+        guard busy == nil else { return }
+        error = false
+        if engine == "meta" { saveKey() }
+        let started = launch(["mode": "queue", "action": "extract", "engine": engine, "db": database.path,
+                              "key": engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : "", "model": model],
+                             owner: .library,
+                             onEvent: { event in
+                                 self.queueEvent(event)
+                                 if event["type"] as? String == "queue" { self.loadLibrary() }
+                             },
+                             onExit: { ok in
+                                 if !ok && !self.error { self.fail("La extracción se ha interrumpido. Vuelve a lanzarla: continuará donde lo dejó.") }
+                                 self.queue("status"); self.loadLibrary()
+                             })
+        if started { status = "Preparando la extracción con \(engineName)…" }
     }
 
     // MARK: Base de conocimiento
@@ -381,7 +423,7 @@ struct ContentView: View {
         return Button {
             app.pane = pane
             if pane == .library { app.loadLibrary(search: !app.query.isEmpty) }
-            if pane == .queue && app.busy != .queue { app.queue("status") }
+            if pane == .queue && app.busy == nil { app.queue("status") }
             if pane == .settings { app.loadKey() }
         } label: {
             HStack(spacing: 10) {
@@ -488,7 +530,7 @@ struct ContentView: View {
                 emptyState("tray", "La cola está vacía", "Añade una lista y reZme irá guardando sus vídeos uno a uno.\nPuedes pausar y continuar cuando quieras.")
             } else {
                 HStack(spacing: 10) {
-                    tile(app.counts["saved"] ?? 0, "Guardados", accent)
+                    tile(app.saved, "Guardados", accent)
                     tile(app.waiting, "En cola")
                     tile(app.counts["failed"] ?? 0, "Fallidos", .red)
                     tile(app.counts["skipped"] ?? 0, "Sin subtítulos", .orange)
@@ -497,15 +539,16 @@ struct ContentView: View {
                     Text("VÍDEOS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     Spacer()
                     Button { app.queue("retry") } label: { Label("Reintentar", systemImage: "arrow.clockwise") }
-                        .disabled(app.busy == .queue || (app.counts["failed"] ?? 0) + (app.counts["skipped"] ?? 0) == 0)
-                    Button { app.queue("clear") } label: { Label("Quitar guardados", systemImage: "checkmark.circle") }
-                        .disabled(app.busy == .queue || (app.counts["saved"] ?? 0) == 0)
+                        .disabled(app.busy != nil || (app.counts["failed"] ?? 0) + (app.counts["skipped"] ?? 0) == 0)
+                    Button { app.queue("clear") } label: { Label("Quitar terminados", systemImage: "checkmark.circle") }
+                        .disabled(app.busy != nil || (app.counts["done"] ?? 0) == 0)
                 }.controlSize(.small).padding(.bottom, 6)
                 rows(app.jobs) { job in
                     HStack(alignment: .top, spacing: 10) {
                         Group {
                             switch job.state {
-                            case "saved": Image(systemName: "checkmark.circle.fill").foregroundStyle(accent)
+                            case "done": Image(systemName: "checkmark.seal.fill").foregroundStyle(accent)
+                            case "saved": Image(systemName: "checkmark.circle").foregroundStyle(accent)
                             case "running": ProgressView().controlSize(.small)
                             case "failed": Image(systemName: "xmark.circle.fill").foregroundStyle(Color.red)
                             case "skipped": Image(systemName: "forward.circle").foregroundStyle(Color.orange)
@@ -533,6 +576,30 @@ struct ContentView: View {
                 tile(app.stats["ungrounded"] ?? 0, "Sin verificar", .orange)
                 tile(app.stats["entities"] ?? 0, "Entidades")
             }.padding(.bottom, 14)
+            if app.busy == .library || app.toExtract > 0 {
+                HStack(spacing: 12) {
+                    Image(systemName: "sparkles").font(.title3).foregroundStyle(accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(app.busy == .library ? "Extrayendo afirmaciones con \(app.engineName)…"
+                             : app.toExtract == 1 ? "1 vídeo tiene transcripción pero aún no afirmaciones"
+                             : "\(app.toExtract) vídeos tienen transcripción pero aún no afirmaciones")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(app.busy == .library ? "Quedan \(app.toExtract). Puedes pausar y continuar después."
+                             : "El modelo lee cada transcripción, extrae las afirmaciones y solo conserva las que puede comprobar en el texto.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if app.busy == .library {
+                        ProgressView().controlSize(.small)
+                        Button("Pausar", action: app.cancel)
+                    } else {
+                        Button(action: app.askExtract) { Label("Extraer afirmaciones", systemImage: "arrow.right").padding(.horizontal, 4) }
+                            .buttonStyle(.borderedProminent).tint(accent).disabled(app.busy != nil)
+                    }
+                }
+                .padding(13).background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.bottom, 14)
+            }
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("Buscar en las afirmaciones verificadas", text: $app.query).textFieldStyle(.plain)
@@ -576,10 +643,6 @@ struct ContentView: View {
                             .background((source.verified > 0 ? accent : Color.gray).opacity(0.12), in: Capsule())
                     }
                 }
-                if (app.stats["verified"] ?? 0) == 0 {
-                    Text("Las afirmaciones se extraen por ahora desde la terminal: python -m rezme queue run --stage all")
-                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled).padding(.top, 8)
-                }
             }
             HStack(spacing: 8) {
                 Image(systemName: "internaldrive").foregroundStyle(.secondary)
@@ -587,6 +650,14 @@ struct ContentView: View {
                 Spacer()
                 Button("Mostrar en Finder", action: app.revealDatabase).controlSize(.small)
             }.padding(.top, 10)
+        }
+        .confirmationDialog("¿Extraer las afirmaciones de \(app.toExtract) vídeos?", isPresented: $app.confirmExtract) {
+            Button("Extraer con \(app.engineName)") { app.extract() }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("Serán unas \(app.stats["calls"] ?? 0) llamadas al modelo, una por cada tramo de 3–4 minutos, y puede tardar horas. "
+                 + (app.engine == "meta" ? "El consumo se factura en tu cuenta de Meta." : "Se usa tu suscripción de Claude Code.")
+                 + " Puedes pausar cuando quieras: continuará donde lo dejó.")
         }
     }
 
@@ -652,15 +723,21 @@ struct ContentView: View {
     var settingsPane: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                header("Ajustes", "Se aplican a la cola y al informe rápido.").padding(.bottom, -6)
-                setting("Clave API de Meta", "Solo para «Informe con Muse Spark». Se guarda en el Llavero de macOS, nunca en un fichero.") {
+                header("Ajustes", "Se aplican a la cola, a la extracción y al informe rápido.").padding(.bottom, -6)
+                setting("Clave API de Meta", "Para el informe y la extracción con Muse Spark. Se guarda en el Llavero de macOS, nunca en un fichero.") {
                     HStack {
                         SecureField("Pega tu clave", text: $app.key).textFieldStyle(.roundedBorder).onSubmit(app.saveKey)
                         Button("Guardar", action: app.saveKey).disabled(app.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         Button("Olvidar", action: app.forgetKey).disabled(app.key.isEmpty)
                     }
                 }
-                setting("Modelo", "Identificador del modelo de Meta para el informe.") {
+                setting("Motor de extracción", "El modelo que lee las transcripciones y extrae las afirmaciones. Muse Spark usa tu clave de Meta y se factura en tu cuenta; Claude Code usa el CLI `claude` instalado en tu Mac y tu suscripción.") {
+                    Picker("", selection: $app.engine) {
+                        Text("Muse Spark (clave de Meta)").tag("meta")
+                        Text("Claude Code").tag("claude-code")
+                    }.labelsHidden().fixedSize().disabled(app.busy == .library)
+                }
+                setting("Modelo", "Identificador del modelo de Meta, para el informe y para la extracción con Muse Spark.") {
                     TextField("muse-spark-1.3", text: $app.model).textFieldStyle(.roundedBorder).frame(width: 260)
                 }
                 setting("Sesión de YouTube", "Opcional: usa la sesión de tu navegador si YouTube pide iniciar sesión o limita las descargas.") {
