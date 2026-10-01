@@ -1,0 +1,2 @@
+### Empresas y valores
+Entidades: `company`, `security`, `sector`, `person`. Separa lo que publica la empresa (`primary_data`) de las estimaciones del autor (`own_calculation`, `own_analysis`) y de los precios objetivo (`forecast`). En `attrs` anota `segmento`, `geografia` o `supuesto` cuando el dato dependa de ellos. Las operaciones del propio autor (compra, vende, mantiene) son `recommendation` con su `stance`.

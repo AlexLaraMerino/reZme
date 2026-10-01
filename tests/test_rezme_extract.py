@@ -74,18 +74,19 @@ class ChunkingTests(unittest.TestCase):
 
     OLD = dict(window_s=210, overlap_s=15, max_chapter_s=360)
 
-    def test_default_chunks_are_about_ten_minutes(self):
+    def test_default_chunks_are_about_five_minutes(self):
         chunks = chunk_transcript(self.cues(n=400))  # 2000 s
-        self.assertEqual([(c.start, c.end) for c in chunks],
-                         [(0.0, 600.0), (580.0, 1180.0), (1160.0, 1760.0), (1740.0, 2005.0)])
-        self.assertEqual(len(chunk_transcript(self.cues())), 2)
+        self.assertEqual([(c.start, c.end) for c in chunks[:3]],
+                         [(0.0, 300.0), (285.0, 585.0), (570.0, 870.0)])
+        self.assertEqual((len(chunks), chunks[-1].end), (7, 2005.0))
+        self.assertEqual(len(chunk_transcript(self.cues())), 4)
 
     def test_short_chapters_are_packed_together(self):
-        chapters = [{"start_time": i * 180, "title": f"C{i + 1}"} for i in range(6)]  # 6 × 3 min
-        chunks = chunk_transcript(self.cues(n=216), chapters, duration=1080)
+        chapters = [{"start_time": i * 120, "title": f"C{i + 1}"} for i in range(6)]  # 6 × 2 min
+        chunks = chunk_transcript(self.cues(n=144), chapters, duration=720)
         self.assertEqual([(c.title, c.start, c.end) for c in chunks],
-                         [("C1 · C2 · C3", 0.0, 540.0), ("C4 · C5 · C6", 540.0, 1085.0)])
-        self.assertEqual(sum(len(c.cues) for c in chunks), 216)  # el corte cae entre capítulos
+                         [("C1 · C2", 0.0, 240.0), ("C3 · C4", 240.0, 480.0), ("C5 · C6", 480.0, 725.0)])
+        self.assertEqual(sum(len(c.cues) for c in chunks), 144)  # el corte cae entre capítulos
 
     def test_windows_keep_start_seconds_and_overlap(self):
         chunks = chunk_transcript(self.cues(), **self.OLD)
@@ -466,7 +467,7 @@ class ExtractTests(ExtractBase):
             self.run_with(response(), domain="astrología")
 
     def test_backend_failure_is_recorded_and_resumable(self):
-        cues = [(i * 20.0, f"frase número {i} del vídeo de prueba") for i in range(80)]  # 3 tramos
+        cues = [(i * 20.0, f"frase número {i} del vídeo de prueba") for i in range(40)]  # 3 tramos
         self.store.save_transcript(self.src, cues, "whisper")
         ok = response()
         result, llm = self.run_with(ok, RuntimeError("claude falló (1)"), ok)
@@ -569,7 +570,7 @@ class ExtractTests(ExtractBase):
     def test_prompt_asks_for_compact_output(self):
         system = prompts.system_prompt()
         self.assertIn("Salida compacta", system)
-        self.assertIn("Como máximo 18 afirmaciones", system)
+        self.assertIn("Como máximo 10 afirmaciones", system)
         self.assertIn("Conocimiento que dura", system)
         self.assertIn("Implicaciones condicionadas", system)
         self.assertIn("repasa tu lista de `claims`", system)

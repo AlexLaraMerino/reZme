@@ -53,6 +53,7 @@ class Backend:
     cost_usd: float | None = None  # acumulado, si el backend lo informa
     input_tokens: int = 0          # acumulados, si el backend los cuenta
     output_tokens: int = 0
+    reasoning_tokens: int = 0      # parte de la salida que el modelo gasta en razonar, si lo informa
 
 
 @contextmanager

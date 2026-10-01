@@ -235,4 +235,11 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   afirmaciones del tramo (dato que apoya una idea, ejemplo de un mecanismo,
   causa, matiz, contradicción) y condicionar cada implicación salvo que el
   efecto sea incondicional.
+- Prompt v5 y tramos de ~5 minutos con un máximo de 10 afirmaciones cada uno.
+  Con tramos de 10 minutos y 18 afirmaciones el modelo escribía hasta 19.000
+  tokens por llamada y tardaba más de los 240 s de plazo: la extracción parecía
+  estancada mientras caducaba y se reintentaba. El plazo de la extracción sube a
+  600 s, un plazo agotado solo se reintenta una vez y, mientras se espera, la
+  app muestra cuánto lleva esperando. El coste por vídeo es de milésimas de
+  dólar, así que más llamadas no son un problema; la fiabilidad sí.
 

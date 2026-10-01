@@ -521,7 +521,7 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
     previous_cost = (run or {}).get("cost_usd") or 0.0
     usage = stats.setdefault("consumo", {"entrada": 0, "salida": 0, "llamadas": 0,
                                          "caracteres_prompt": 0, "caracteres_transcripcion": 0})
-    seen_in, seen_out = base_in, base_out
+    seen_in, seen_out, seen_reasoning = base_in, base_out, backend.reasoning_tokens
 
     failures = 0
     for chunk in chunks:
@@ -552,7 +552,9 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
         result.llm_calls += calls
         usage["entrada"] += backend.input_tokens - seen_in
         usage["salida"] += backend.output_tokens - seen_out
+        usage["razonamiento"] = usage.get("razonamiento", 0) + backend.reasoning_tokens - seen_reasoning
         seen_in, seen_out = backend.input_tokens, backend.output_tokens
+        seen_reasoning = backend.reasoning_tokens
         usage["llamadas"] += calls
         usage["caracteres_prompt"] += len(system) + len(user)
         usage["caracteres_transcripcion"] += len(render(chunk))

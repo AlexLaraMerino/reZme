@@ -41,6 +41,10 @@ class MetaRateLimit(RuntimeError):
 
 
 META_URL = "https://api.meta.ai/v1/chat/completions"
+# El modelo puede tardar varios minutos en escribir una respuesta larga.
+REPORT_TIMEOUT = 240
+EXTRACT_TIMEOUT = 600
+HEARTBEAT_S = 20
 REPORT_MAX_TOKENS = 12000
 # La extracción devuelve JSON largo y algunos modelos gastan tokens en razonar antes de escribir.
 EXTRACT_MAX_TOKENS = 32000
@@ -61,7 +65,7 @@ def _retry_after(headers):
         return None
 
 
-def _meta_request(messages, key, model, max_tokens):
+def _meta_request(messages, key, model, max_tokens, timeout=REPORT_TIMEOUT):
     """Una petición a Meta. Devuelve la respuesta ya decodificada o lanza un error clasificado."""
     request = urllib.request.Request(
         META_URL,
@@ -69,7 +73,7 @@ def _meta_request(messages, key, model, max_tokens):
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=240) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         try:
@@ -120,6 +124,7 @@ def call_meta_extract(system, user, key, model, usage=None, notify=None):
       afirmaciones completas en lugar de perder el tramo.
     - Solo renuncia (MetaRateLimit) si Meta sigue limitando tras todas las esperas.
     """
+    import threading
     import time
 
     notify = notify or (lambda message: None)
@@ -128,9 +133,24 @@ def call_meta_extract(system, user, key, model, usage=None, notify=None):
     limited = errors = 0
     if _pace["seconds"] >= 1:
         time.sleep(_pace["seconds"])
+
+    def request():
+        # Señal de vida: la respuesta puede tardar minutos y sin esto la app parece parada.
+        done, started = threading.Event(), time.monotonic()
+
+        def beat():
+            while not done.wait(HEARTBEAT_S):
+                waited = int(time.monotonic() - started)
+                notify(f"esperando la respuesta del modelo ({waited // 60} min {waited % 60:02d} s)…")
+        threading.Thread(target=beat, daemon=True).start()
+        try:
+            return _meta_request(messages, key, model, max_tokens, EXTRACT_TIMEOUT)
+        finally:
+            done.set()
+
     while True:
         try:
-            data = _meta_request(messages, key, model, max_tokens)
+            data = request()
             break
         except ValueError:  # el modelo no admite una respuesta tan larga
             if max_tokens == REPORT_MAX_TOKENS:
@@ -150,8 +170,9 @@ def call_meta_extract(system, user, key, model, usage=None, notify=None):
             if errors >= len(ERROR_WAITS):
                 raise RuntimeError(str(error) or "No se pudo contactar con Meta.") from None
             wait = ERROR_WAITS[errors]
-            errors += 1
-            notify(f"Meta no responde bien: espero {wait} s y reintento…")
+            # Un plazo agotado ya ha costado diez minutos: solo se reintenta una vez.
+            errors += 2 if isinstance(error, TimeoutError) or "timed out" in str(error).lower() else 1
+            notify(f"Meta no responde bien ({str(error)[:80] or 'sin respuesta'}): espero {wait} s y reintento…")
             time.sleep(wait)
     if not limited:
         _pace["seconds"] = _pace["seconds"] * 0.8 if _pace["seconds"] >= 1.25 else 0.0
@@ -252,6 +273,9 @@ def extraction_backend(options):
 
     engine = options.get("engine") or "meta"
     usage = {}
+    # Qué tramo se está procesando, para que los avisos de espera digan a qué vídeo se refieren.
+    current = {"label": ""}
+    notify = lambda message: emit("progress", message=f"{current['label']} · {message}" if current["label"] else message)
     if engine == "meta":
         key, model = options.get("key", "").strip(), options.get("model") or "muse-spark-1.3"
         if not key:
@@ -259,8 +283,7 @@ def extraction_backend(options):
 
         def ask(system, user):
             try:
-                return call_meta_extract(system, user, key, model, usage,
-                                         notify=lambda message: emit("progress", message=message))
+                return call_meta_extract(system, user, key, model, usage, notify=notify)
             except MetaAccessError as error:
                 raise backends.BackendUnavailable(str(error)) from None
             except MetaRateLimit:
@@ -290,6 +313,9 @@ def extraction_backend(options):
         tokens_out = int(usage.get("completion_tokens") or len(text) / CHARS_PER_TOKEN)
         backend.input_tokens += tokens_in
         backend.output_tokens += tokens_out
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+            backend.reasoning_tokens += details["reasoning_tokens"]
         if engine == "claude-code" and backend.cost_usd is not None:
             cost = backend.cost_usd - reported           # lo informa el CLI
         else:
@@ -301,7 +327,7 @@ def extraction_backend(options):
         return text
 
     backend.call = call
-    return backend, spent
+    return backend, spent, current
 
 
 def run_queue(options):
@@ -335,14 +361,18 @@ def run_queue(options):
                                  notes=None, started_at=None, finished_at=None)
         elif action == "extract":
             from rezme import extract
-            backend, spent = extraction_backend(options)
+            backend, spent, current = extraction_backend(options)
             ids = [int(part) for part in str(options.get("ids") or "").split(",") if part.strip().isdigit()]
 
             def extractor(target, source_id):
                 title = (target.get_source_by_id(source_id) or {}).get("title") or "Vídeo"
-                return extract.extract_source(
-                    target, source_id, backend,
-                    progress=lambda message: progress(f"{title} · {message.strip().rstrip('…')}"))
+                def step(message):
+                    current["label"] = f"{title} · {message.strip().rstrip('…')}"
+                    progress(current["label"])
+                try:
+                    return extract.extract_source(target, source_id, backend, progress=step)
+                finally:
+                    current["label"] = ""
 
             deps = batch.Deps()
             deps.extractor = extractor

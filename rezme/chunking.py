@@ -1,7 +1,8 @@
 """Troceado de la transcripción en tramos para la extracción.
 
-Tramos de unos 10 minutos: cada llamada al modelo repite las instrucciones
-enteras, así que tramos cortos multiplican el coste sin aportar nada. Si el
+Tramos de unos 5 minutos. Más cortos multiplican las llamadas (cada una repite
+las instrucciones enteras); más largos hacen que el modelo tarde varios minutos
+en responder y que la llamada caduque o la respuesta se corte. Si el
 vídeo tiene capítulos, se agrupan capítulos consecutivos hasta llenar un tramo
 (el corte cae siempre entre capítulos); los capítulos largos y los vídeos sin
 capítulos se parten en ventanas con un solape pequeño. Cada tramo conserva sus
@@ -13,9 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-WINDOW_S = 600.0
-OVERLAP_S = 20.0
-MAX_CHAPTER_S = 900.0
+WINDOW_S = 300.0
+OVERLAP_S = 15.0
+MAX_CHAPTER_S = 450.0
 # Sin duración conocida, se supone que el último cue dura esto.
 LAST_CUE_S = 10.0
 

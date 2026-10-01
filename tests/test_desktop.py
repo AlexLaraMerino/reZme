@@ -294,6 +294,42 @@ class DesktopTests(unittest.TestCase):
                 self.assertEqual({j["status"] for j in store.list_jobs()}, {"pending"})
         worker._pace["seconds"] = 0.0
 
+    def test_slow_model_is_given_time_and_reports_it_is_alive(self):
+        import time as real_time
+        ok = {"choices": [{"finish_reason": "stop", "message": {"content": '{"claims": []}'}}],
+              "usage": {"prompt_tokens": 10, "completion_tokens": 900,
+                        "completion_tokens_details": {"reasoning_tokens": 700}}}
+        seen = {}
+
+        def slow(request, timeout=None):
+            seen["timeout"] = timeout
+            real_time.sleep(0.08)
+            return io.StringIO(json.dumps(ok))
+
+        notes, usage = [], {}
+        worker._pace["seconds"] = 0.0
+        with patch.object(worker.urllib.request, "urlopen", slow), patch.object(worker, "HEARTBEAT_S", 0.02):
+            worker.call_meta_extract("S", "u", "k", "m", usage, notes.append)
+        self.assertEqual(seen["timeout"], worker.EXTRACT_TIMEOUT)
+        self.assertGreaterEqual(worker.EXTRACT_TIMEOUT, 600)
+        self.assertTrue(notes and all("esperando la respuesta del modelo" in n for n in notes))
+        self.assertEqual(usage["completion_tokens_details"]["reasoning_tokens"], 700)
+
+    def test_timeout_is_retried_only_once(self):
+        calls = []
+
+        def timed_out(request, timeout=None):
+            calls.append(timeout)
+            raise TimeoutError("The read operation timed out")
+
+        notes = []
+        worker._pace["seconds"] = 0.0
+        with patch.object(worker.urllib.request, "urlopen", timed_out), patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                worker.call_meta_extract("S", "u", "k", "m", None, notes.append)
+        self.assertEqual((len(calls), sleep.call_count), (2, 1))
+        self.assertIn("The read operation timed out", notes[-1])
+
     def test_exhausted_quota_is_not_retried(self):
         urlopen, sent = self.meta_responses((429, {}, '{"error": {"message": "Insufficient balance"}}'))
         with patch.object(worker.urllib.request, "urlopen", urlopen), patch("time.sleep") as sleep:
