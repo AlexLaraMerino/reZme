@@ -25,3 +25,9 @@ transcripts/
 *.key
 .idea/
 .vscode/
+
+# Base de conocimiento local (contiene transcripciones de terceros).
+rezme_data/
+*.db
+*.db-wal
+*.db-shm

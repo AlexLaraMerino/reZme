@@ -1,0 +1,470 @@
+"""Almacén SQLite de reZme (solo biblioteca estándar).
+
+Reglas que el almacén hace cumplir:
+  - Las transcripciones crudas se guardan una vez (hash) y permiten reextraer.
+  - Los agentes solo reciben afirmaciones `verified`, vigentes y, si se pide,
+    conocidas hasta una fecha (consultas «point-in-time» para backtesting).
+  - Una entidad ambigua nunca se resuelve en silencio.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any, Iterable
+
+from .schema import (
+    CLAIM_STATUSES, CLAIM_TYPES, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES,
+    FORECAST_RESOLUTIONS, IMPLICATION_BASES, SCHEMA_VERSION, STANCES,
+    TRANSCRIPT_ORIGINS, Claim, Entity, Implication, ValidationError,
+    default_expires_at, normalize_name, utc_now,
+)
+
+
+class AmbiguousEntity(ValueError):
+    """El nombre corresponde a más de una entidad; hay que indicar el tipo."""
+
+
+def _in(values: Iterable[str]) -> str:
+    return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+
+
+DDL = f"""
+CREATE TABLE sources (
+    id INTEGER PRIMARY KEY,
+    platform TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    url TEXT, title TEXT, channel TEXT, channel_id TEXT,
+    published_at TEXT, duration_s REAL, language TEXT,
+    description TEXT, chapters_json TEXT,
+    captured_at TEXT NOT NULL,
+    UNIQUE (platform, external_id)
+);
+
+CREATE TABLE transcripts (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    origin TEXT NOT NULL CHECK (origin IN ({_in(TRANSCRIPT_ORIGINS)})),
+    language TEXT,
+    cues_json TEXT NOT NULL,
+    n_cues INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (source_id, sha256)
+);
+
+CREATE TABLE extraction_runs (
+    id INTEGER PRIMARY KEY,
+    model TEXT, backend TEXT, prompt_version TEXT,
+    schema_version INTEGER NOT NULL,
+    cost_usd REAL, notes TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE entities (
+    id INTEGER PRIMARY KEY,
+    type TEXT NOT NULL CHECK (type IN ({_in(ENTITY_TYPES)})),
+    canonical_name TEXT NOT NULL,
+    norm_name TEXT NOT NULL,
+    external_ids_json TEXT NOT NULL DEFAULT '{{}}',
+    created_at TEXT NOT NULL,
+    UNIQUE (type, norm_name)
+);
+
+CREATE TABLE entity_aliases (
+    id INTEGER PRIMARY KEY,
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL,
+    norm_alias TEXT NOT NULL,
+    UNIQUE (entity_id, norm_alias)
+);
+CREATE INDEX idx_alias_norm ON entity_aliases(norm_alias);
+
+CREATE TABLE claims (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    transcript_id INTEGER REFERENCES transcripts(id) ON DELETE SET NULL,
+    run_id INTEGER REFERENCES extraction_runs(id) ON DELETE SET NULL,
+    entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+    type TEXT NOT NULL CHECK (type IN ({_in(CLAIM_TYPES)})),
+    domain TEXT,
+    statement TEXT NOT NULL,
+    evidence_grade TEXT NOT NULL CHECK (evidence_grade IN ({_in(EVIDENCE_GRADES)})),
+    stance TEXT NOT NULL CHECK (stance IN ({_in(STANCES)})),
+    metric_name TEXT, metric_value REAL, metric_unit TEXT,
+    metric_period TEXT, currency TEXT,
+    as_of TEXT, valid_from TEXT, valid_to TEXT, horizon TEXT,
+    ts_start REAL, ts_end REAL, quote TEXT, confidence REAL,
+    attrs_json TEXT NOT NULL DEFAULT '{{}}',
+    status TEXT NOT NULL CHECK (status IN ({_in(CLAIM_STATUSES)})),
+    published_at TEXT, captured_at TEXT NOT NULL, expires_at TEXT,
+    fingerprint TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_claim_dedupe ON claims(source_id, IFNULL(run_id, 0), fingerprint);
+CREATE INDEX idx_claim_entity ON claims(entity_id);
+CREATE INDEX idx_claim_status ON claims(status, expires_at);
+
+CREATE VIRTUAL TABLE claims_fts USING fts5(
+    statement, quote, content='claims', content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER claims_ai AFTER INSERT ON claims BEGIN
+    INSERT INTO claims_fts(rowid, statement, quote) VALUES (new.id, new.statement, new.quote);
+END;
+CREATE TRIGGER claims_ad AFTER DELETE ON claims BEGIN
+    INSERT INTO claims_fts(claims_fts, rowid, statement, quote)
+    VALUES ('delete', old.id, old.statement, old.quote);
+END;
+CREATE TRIGGER claims_au AFTER UPDATE OF statement, quote ON claims BEGIN
+    INSERT INTO claims_fts(claims_fts, rowid, statement, quote)
+    VALUES ('delete', old.id, old.statement, old.quote);
+    INSERT INTO claims_fts(rowid, statement, quote) VALUES (new.id, new.statement, new.quote);
+END;
+
+CREATE TABLE implications (
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    target_entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+    target_label TEXT,
+    direction TEXT NOT NULL CHECK (direction IN ({_in(DIRECTIONS)})),
+    mechanism TEXT, horizon TEXT, strength REAL, confidence REAL,
+    basis TEXT NOT NULL CHECK (basis IN ({_in(IMPLICATION_BASES)})),
+    created_at TEXT NOT NULL,
+    CHECK (target_entity_id IS NOT NULL OR target_label IS NOT NULL)
+);
+CREATE INDEX idx_impl_claim ON implications(claim_id);
+CREATE INDEX idx_impl_target ON implications(target_entity_id);
+
+CREATE TABLE forecasts (
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL UNIQUE REFERENCES claims(id) ON DELETE CASCADE,
+    target_date TEXT,
+    resolution TEXT NOT NULL DEFAULT 'pending'
+        CHECK (resolution IN ({_in(FORECAST_RESOLUTIONS)})),
+    resolved_at TEXT, notes TEXT
+);
+
+CREATE TABLE source_profiles (
+    id INTEGER PRIMARY KEY,
+    platform TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{{}}',
+    updated_at TEXT NOT NULL,
+    UNIQUE (platform, channel_id)
+);
+"""
+
+_STATS_TABLES = ("sources", "transcripts", "entities", "claims", "implications",
+                 "forecasts", "extraction_runs")
+
+
+def _fts_query(text: str) -> str:
+    """Convierte texto libre en una consulta FTS5 segura (todas las palabras)."""
+    tokens = re.findall(r"\w+", text, flags=re.UNICODE)
+    if not tokens:
+        raise ValueError("consulta vacía")
+    return " ".join('"' + t + '"' for t in tokens)
+
+
+def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
+
+
+class Store:
+    def __init__(self, path: str | Path = ":memory:"):
+        self.path = str(path)
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys = ON")
+        if self.path != ":memory:":
+            self.db.execute("PRAGMA journal_mode = WAL")
+        self._migrate()
+
+    # -- ciclo de vida -----------------------------------------------------
+
+    def _migrate(self) -> None:
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"La base tiene esquema v{version}, más nuevo que esta versión (v{SCHEMA_VERSION}).")
+        if version == 0:
+            with self.db:
+                self.db.executescript(DDL)
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def close(self) -> None:
+        self.db.close()
+
+    def __enter__(self) -> "Store":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- fuentes y transcripciones ------------------------------------------
+
+    def add_source(self, platform: str, external_id: str, *, url: str | None = None,
+                   title: str | None = None, channel: str | None = None,
+                   channel_id: str | None = None, published_at: str | None = None,
+                   duration_s: float | None = None, language: str | None = None,
+                   description: str | None = None,
+                   chapters: list[dict[str, Any]] | None = None) -> tuple[int, bool]:
+        """Crea la fuente o completa la existente sin pisar datos con vacíos."""
+        existing = self.get_source(platform, external_id)
+        chapters_json = json.dumps(chapters, ensure_ascii=False) if chapters else None
+        with self.db:
+            if existing:
+                self.db.execute(
+                    """UPDATE sources SET
+                        url=COALESCE(?, url), title=COALESCE(?, title),
+                        channel=COALESCE(?, channel), channel_id=COALESCE(?, channel_id),
+                        published_at=COALESCE(?, published_at),
+                        duration_s=COALESCE(?, duration_s), language=COALESCE(?, language),
+                        description=COALESCE(?, description),
+                        chapters_json=COALESCE(?, chapters_json)
+                       WHERE id=?""",
+                    (url, title, channel, channel_id, published_at, duration_s, language,
+                     description, chapters_json, existing["id"]))
+                return existing["id"], False
+            cur = self.db.execute(
+                """INSERT INTO sources (platform, external_id, url, title, channel, channel_id,
+                    published_at, duration_s, language, description, chapters_json, captured_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (platform, external_id, url, title, channel, channel_id, published_at,
+                 duration_s, language, description, chapters_json, utc_now()))
+            return cur.lastrowid, True
+
+    def get_source(self, platform: str, external_id: str) -> dict[str, Any] | None:
+        return _row(self.db.execute(
+            "SELECT * FROM sources WHERE platform=? AND external_id=?",
+            (platform, external_id)).fetchone())
+
+    def save_transcript(self, source_id: int, cues: list[tuple[float, str]], origin: str,
+                        language: str | None = None) -> tuple[int, bool]:
+        """Guarda los cues crudos. Mismo contenido para la misma fuente = no-op."""
+        if origin not in TRANSCRIPT_ORIGINS:
+            raise ValidationError(f"origin no válido: {origin!r}")
+        if not cues:
+            raise ValidationError("transcripción vacía")
+        canonical = json.dumps([[round(float(s), 3), t] for s, t in cues],
+                               ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        row = self.db.execute("SELECT id FROM transcripts WHERE source_id=? AND sha256=?",
+                              (source_id, digest)).fetchone()
+        if row:
+            return row["id"], False
+        with self.db:
+            cur = self.db.execute(
+                """INSERT INTO transcripts (source_id, origin, language, cues_json, n_cues,
+                    sha256, created_at) VALUES (?,?,?,?,?,?,?)""",
+                (source_id, origin, language, canonical, len(cues), digest, utc_now()))
+        return cur.lastrowid, True
+
+    def latest_transcript(self, source_id: int) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM transcripts WHERE source_id=? ORDER BY id DESC LIMIT 1",
+            (source_id,)).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["cues"] = [(s, t) for s, t in json.loads(out.pop("cues_json"))]
+        return out
+
+    # -- entidades ----------------------------------------------------------
+
+    def upsert_entity(self, type: str, canonical_name: str, aliases: Iterable[str] = (),
+                      external_ids: dict[str, str] | None = None) -> int:
+        entity = Entity(type, canonical_name, list(aliases), dict(external_ids or {})).validate()
+        norm = normalize_name(entity.canonical_name)
+        with self.db:
+            row = self.db.execute("SELECT id, external_ids_json FROM entities "
+                                  "WHERE type=? AND norm_name=?", (entity.type, norm)).fetchone()
+            if row is None:  # ¿ya existe con ese nombre como alias dentro del tipo?
+                row = self.db.execute(
+                    """SELECT e.id, e.external_ids_json FROM entities e
+                       JOIN entity_aliases a ON a.entity_id = e.id
+                       WHERE e.type=? AND a.norm_alias=?""", (entity.type, norm)).fetchone()
+            if row is None:
+                cur = self.db.execute(
+                    "INSERT INTO entities (type, canonical_name, norm_name, external_ids_json,"
+                    " created_at) VALUES (?,?,?,?,?)",
+                    (entity.type, entity.canonical_name.strip(), norm,
+                     json.dumps(entity.external_ids, ensure_ascii=False), utc_now()))
+                entity_id = cur.lastrowid
+            else:
+                entity_id = row["id"]
+                merged = {**json.loads(row["external_ids_json"]), **entity.external_ids}
+                self.db.execute("UPDATE entities SET external_ids_json=? WHERE id=?",
+                                (json.dumps(merged, ensure_ascii=False), entity_id))
+            for alias in entity.aliases:
+                n = normalize_name(alias)
+                if n and n != norm:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, norm_alias)"
+                        " VALUES (?,?,?)", (entity_id, alias.strip(), n))
+        return entity_id
+
+    def resolve_entity(self, name: str, type: str | None = None) -> int | None:
+        """Id de la entidad con ese nombre o alias. None si no existe.
+
+        Lanza AmbiguousEntity si hay varias y no se indicó el tipo: un agente
+        que opera con capital no debe confundir dos entidades parecidas.
+        """
+        norm = normalize_name(name)
+        if not norm:
+            return None
+        sql = """SELECT DISTINCT e.id FROM entities e
+                 LEFT JOIN entity_aliases a ON a.entity_id = e.id
+                 WHERE (e.norm_name = ? OR a.norm_alias = ?)"""
+        params: list[Any] = [norm, norm]
+        if type:
+            sql += " AND e.type = ?"
+            params.append(type)
+        ids = [r["id"] for r in self.db.execute(sql, params)]
+        if len(ids) > 1:
+            raise AmbiguousEntity(f"{name!r} coincide con {len(ids)} entidades; indica el tipo")
+        return ids[0] if ids else None
+
+    def get_entity(self, entity_id: int) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM entities WHERE id=?", (entity_id,)).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["external_ids"] = json.loads(out.pop("external_ids_json"))
+        out["aliases"] = [r["alias"] for r in self.db.execute(
+            "SELECT alias FROM entity_aliases WHERE entity_id=? ORDER BY alias", (entity_id,))]
+        return out
+
+    # -- extracción ----------------------------------------------------------
+
+    def start_run(self, *, model: str | None = None, backend: str | None = None,
+                  prompt_version: str | None = None, cost_usd: float | None = None,
+                  notes: str | None = None) -> int:
+        with self.db:
+            cur = self.db.execute(
+                """INSERT INTO extraction_runs (model, backend, prompt_version, schema_version,
+                    cost_usd, notes, created_at) VALUES (?,?,?,?,?,?,?)""",
+                (model, backend, prompt_version, SCHEMA_VERSION, cost_usd, notes, utc_now()))
+        return cur.lastrowid
+
+    def add_claim(self, claim: Claim) -> tuple[int, bool]:
+        """Inserta la afirmación (siempre validada). Devuelve (id, creada)."""
+        claim.validate()
+        src = self.db.execute("SELECT published_at FROM sources WHERE id=?",
+                              (claim.source_id,)).fetchone()
+        if src is None:
+            raise ValidationError(f"la fuente {claim.source_id} no existe")
+        fingerprint = claim.fingerprint()
+        dup = self.db.execute(
+            "SELECT id FROM claims WHERE source_id=? AND IFNULL(run_id,0)=? AND fingerprint=?",
+            (claim.source_id, claim.run_id or 0, fingerprint)).fetchone()
+        if dup:
+            return dup["id"], False
+        captured = utc_now()
+        published = claim.published_at or src["published_at"]
+        expires = claim.expires_at or default_expires_at(
+            claim.type, published or captured, claim.valid_to)
+        with self.db:
+            cur = self.db.execute(
+                """INSERT INTO claims (source_id, transcript_id, run_id, entity_id, type, domain,
+                    statement, evidence_grade, stance, metric_name, metric_value, metric_unit,
+                    metric_period, currency, as_of, valid_from, valid_to, horizon, ts_start,
+                    ts_end, quote, confidence, attrs_json, status, published_at, captured_at,
+                    expires_at, fingerprint)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (claim.source_id, claim.transcript_id, claim.run_id, claim.entity_id, claim.type,
+                 claim.domain, claim.statement.strip(), claim.evidence_grade, claim.stance,
+                 claim.metric_name, claim.metric_value, claim.metric_unit, claim.metric_period,
+                 claim.currency, claim.as_of, claim.valid_from, claim.valid_to, claim.horizon,
+                 claim.ts_start, claim.ts_end, claim.quote, claim.confidence,
+                 json.dumps(claim.attrs, ensure_ascii=False), claim.status, published, captured,
+                 expires, fingerprint))
+        return cur.lastrowid, True
+
+    def set_claim_status(self, claim_id: int, status: str) -> None:
+        if status not in CLAIM_STATUSES:
+            raise ValidationError(f"status no válido: {status!r}")
+        with self.db:
+            cur = self.db.execute("UPDATE claims SET status=? WHERE id=?", (status, claim_id))
+        if cur.rowcount == 0:
+            raise KeyError(f"afirmación {claim_id} no existe")
+
+    def add_implication(self, implication: Implication) -> int:
+        implication.validate()
+        with self.db:
+            cur = self.db.execute(
+                """INSERT INTO implications (claim_id, target_entity_id, target_label, direction,
+                    mechanism, horizon, strength, confidence, basis, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (implication.claim_id, implication.target_entity_id, implication.target_label,
+                 implication.direction, implication.mechanism, implication.horizon,
+                 implication.strength, implication.confidence, implication.basis, utc_now()))
+        return cur.lastrowid
+
+    # -- consulta (lo que verán los agentes) ---------------------------------
+
+    def search_claims(self, query: str | None = None, *, status: str | None = "verified",
+                      domain: str | None = None, entity_id: int | None = None,
+                      type: str | None = None, known_at: str | None = None,
+                      include_expired: bool = False, limit: int = 20) -> list[dict[str, Any]]:
+        """Búsqueda de afirmaciones con las garantías pensadas para agentes.
+
+        - `status='verified'` por defecto (None = todas, solo para depuración).
+        - Se ocultan las caducadas salvo `include_expired`.
+        - `known_at` (ISO) devuelve lo que se sabía ese día: fecha de la fuente
+          <= known_at y caducidad evaluada en ese momento. Sirve para backtesting.
+        """
+        now = known_at or utc_now()
+        where, params = [], []  # type: list[str], list[Any]
+        if query:
+            sql = ("SELECT c.*, e.canonical_name AS entity_name FROM claims_fts "
+                   "JOIN claims c ON c.id = claims_fts.rowid "
+                   "LEFT JOIN entities e ON e.id = c.entity_id ")
+            where.append("claims_fts MATCH ?")
+            params.append(_fts_query(query))
+            order = "ORDER BY bm25(claims_fts)"
+        else:
+            sql = ("SELECT c.*, e.canonical_name AS entity_name FROM claims c "
+                   "LEFT JOIN entities e ON e.id = c.entity_id ")
+            order = "ORDER BY c.id DESC"
+        if status:
+            where.append("c.status = ?")
+            params.append(status)
+        if domain:
+            where.append("c.domain = ?")
+            params.append(domain)
+        if entity_id is not None:
+            where.append("c.entity_id = ?")
+            params.append(entity_id)
+        if type:
+            where.append("c.type = ?")
+            params.append(type)
+        if known_at:
+            where.append("COALESCE(c.published_at, c.captured_at) <= ?")
+            params.append(known_at)
+        if not include_expired:
+            where.append("(c.expires_at IS NULL OR c.expires_at > ?)")
+            params.append(now)
+        sql += "WHERE " + " AND ".join(where) + f" {order} LIMIT ?"
+        params.append(int(limit))
+        out = []
+        for row in self.db.execute(sql, params):
+            item = dict(row)
+            item["attrs"] = json.loads(item.pop("attrs_json"))
+            out.append(item)
+        return out
+
+    def implications_for(self, claim_id: int) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM implications WHERE claim_id=? ORDER BY id", (claim_id,))]
+
+    def stats(self) -> dict[str, Any]:
+        out: dict[str, Any] = {t: self.db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                               for t in _STATS_TABLES}
+        out["claims_by_status"] = {r["status"]: r["n"] for r in self.db.execute(
+            "SELECT status, COUNT(*) AS n FROM claims GROUP BY status")}
+        return out
