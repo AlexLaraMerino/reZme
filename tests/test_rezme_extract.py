@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import yt_digest
-from rezme import Store, prompts
+from rezme import SCHEMA_VERSION, Store, prompts
 from rezme import backends as bk
 from rezme import cli
 from rezme import evaluate as ev
@@ -379,7 +379,8 @@ class ExtractTests(ExtractBase):
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'claims_fts%'")}
         self.assertEqual(tables, {"sources", "transcripts", "extraction_runs", "entities",
                                   "entity_aliases", "claims", "implications", "forecasts",
-                                  "source_profiles"})
+                                  "source_profiles", "jobs"})
+        self.assertEqual(self.store.stats()["jobs"], 0)  # extraer no encola trabajo alguno
 
     def test_transcript_cannot_close_its_own_tag(self):
         self.store.save_transcript(
@@ -639,7 +640,7 @@ class MigrationTests(unittest.TestCase):
             with Store(path) as store:
                 run = store.get_run(1)
                 self.assertEqual((run["model"], run["source_id"], run["stats"]), ("m", None, {}))
-                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

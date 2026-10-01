@@ -17,7 +17,7 @@ from typing import Any, Iterable
 
 from .schema import (
     CLAIM_STATUSES, CLAIM_TYPES, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES,
-    FORECAST_RESOLUTIONS, IMPLICATION_BASES, SCHEMA_VERSION, STANCES,
+    FORECAST_RESOLUTIONS, IMPLICATION_BASES, JOB_STAGES, JOB_STATUSES, SCHEMA_VERSION, STANCES,
     TRANSCRIPT_ORIGINS, Claim, Entity, Implication, ValidationError,
     default_expires_at, normalize_name, utc_now,
 )
@@ -30,6 +30,25 @@ class AmbiguousEntity(ValueError):
 def _in(values: Iterable[str]) -> str:
     return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
 
+
+# Cola de procesamiento por lotes: un trabajo por vídeo.
+JOBS_DDL = f"""
+CREATE TABLE jobs (
+    id INTEGER PRIMARY KEY,
+    video_id TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    playlist_url TEXT,
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ({_in(JOB_STATUSES)})),
+    stage TEXT NOT NULL DEFAULT 'ingest' CHECK (stage IN ({_in(JOB_STAGES)})),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    started_at TEXT, finished_at TEXT, notes TEXT
+);
+CREATE INDEX idx_jobs_next ON jobs(status, priority DESC, id);
+"""
 
 DDL = f"""
 CREATE TABLE sources (
@@ -157,7 +176,7 @@ CREATE TABLE source_profiles (
     updated_at TEXT NOT NULL,
     UNIQUE (platform, channel_id)
 );
-"""
+""" + JOBS_DDL
 
 # Pasos desde cada versión antigua hasta la actual.
 _MIGRATIONS = {
@@ -167,10 +186,13 @@ ALTER TABLE extraction_runs ADD COLUMN transcript_id INTEGER
     REFERENCES transcripts(id) ON DELETE SET NULL;
 ALTER TABLE extraction_runs ADD COLUMN stats_json TEXT NOT NULL DEFAULT '{}';
 """,
+    2: JOBS_DDL,
 }
 
 _STATS_TABLES = ("sources", "transcripts", "entities", "claims", "implications",
-                 "forecasts", "extraction_runs")
+                 "forecasts", "extraction_runs", "jobs")
+_JOB_FIELDS = frozenset({"status", "stage", "attempts", "last_error", "priority", "started_at",
+                         "finished_at", "notes", "title"})
 
 
 def _fts_query(text: str) -> str:
@@ -195,7 +217,11 @@ class Store:
         self.db.execute("PRAGMA foreign_keys = ON")
         if self.path != ":memory:":
             self.db.execute("PRAGMA journal_mode = WAL")
-        self._migrate()
+        try:
+            self._migrate()
+        except BaseException:
+            self.db.close()
+            raise
 
     # -- ciclo de vida -----------------------------------------------------
 
@@ -208,10 +234,10 @@ class Store:
             with self.db:
                 self.db.executescript(DDL)
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif version < SCHEMA_VERSION:
-            with self.db:
-                self.db.executescript(_MIGRATIONS[version])
-                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        for step in range(version or SCHEMA_VERSION, SCHEMA_VERSION):
+            # Cada paso va en su transacción: si falla, la base queda en la versión anterior.
+            self.db.executescript(
+                f"BEGIN;\n{_MIGRATIONS[step]}\nPRAGMA user_version = {step + 1};\nCOMMIT;")
 
     def close(self) -> None:
         self.db.close()
@@ -510,6 +536,99 @@ class Store:
                  implication.direction, implication.mechanism, implication.horizon,
                  implication.strength, implication.confidence, implication.basis, utc_now()))
         return cur.lastrowid
+
+    # -- cola de trabajos ------------------------------------------------------
+
+    def enqueue_job(self, video_id: str, url: str, *, playlist_url: str | None = None,
+                    title: str | None = None, priority: int = 0, stage: str = "ingest",
+                    notes: str | None = None) -> tuple[int, bool]:
+        """Encola un vídeo. Si ya estaba en la cola devuelve (id, False) sin tocarlo."""
+        if stage not in JOB_STAGES:
+            raise ValidationError(f"stage no válido: {stage!r}")
+        row = self.db.execute("SELECT id FROM jobs WHERE video_id=?", (video_id,)).fetchone()
+        if row:
+            return row["id"], False
+        with self.db:
+            cur = self.db.execute(
+                """INSERT INTO jobs (video_id, url, playlist_url, title, stage, priority, notes,
+                    created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                (video_id, url, playlist_url, title, stage, int(priority), notes, utc_now()))
+        return cur.lastrowid, True
+
+    def get_job(self, job_id: int) -> dict[str, Any] | None:
+        return _row(self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+
+    def update_job(self, job_id: int, **fields: Any) -> None:
+        unknown = set(fields) - _JOB_FIELDS
+        if unknown:
+            raise ValidationError(f"campos de trabajo no válidos: {', '.join(sorted(unknown))}")
+        if "status" in fields and fields["status"] not in JOB_STATUSES:
+            raise ValidationError(f"status no válido: {fields['status']!r}")
+        if "stage" in fields and fields["stage"] not in JOB_STAGES:
+            raise ValidationError(f"stage no válido: {fields['stage']!r}")
+        if not fields:
+            return
+        sets = ", ".join(f"{name}=?" for name in fields)
+        with self.db:
+            cur = self.db.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*fields.values(), job_id))
+        if cur.rowcount == 0:
+            raise KeyError(f"el trabajo {job_id} no existe")
+
+    def pending_jobs(self, *, stages: Iterable[str] = JOB_STAGES, status: str = "pending",
+                     notes: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        """Trabajos por procesar: primero mayor prioridad, después orden de entrada."""
+        stages = list(stages)
+        sql = (f"SELECT * FROM jobs WHERE status=? AND stage IN ({','.join('?' * len(stages))})")
+        params: list[Any] = [status, *stages]
+        if notes is not None:
+            sql += " AND notes = ?"
+            params.append(notes)
+        sql += " ORDER BY priority DESC, id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [dict(r) for r in self.db.execute(sql, params)]
+
+    def list_jobs(self, status: str | None = None) -> list[dict[str, Any]]:
+        if status is not None and status not in JOB_STATUSES:
+            raise ValidationError(f"status no válido: {status!r}")
+        sql, params = "SELECT * FROM jobs", []  # type: str, list[Any]
+        if status:
+            sql += " WHERE status=?"
+            params.append(status)
+        return [dict(r) for r in self.db.execute(sql + " ORDER BY priority DESC, id", params)]
+
+    def job_counts(self) -> dict[str, int]:
+        return {r["k"]: r["n"] for r in self.db.execute(
+            "SELECT status || '/' || stage AS k, COUNT(*) AS n FROM jobs GROUP BY status, stage")}
+
+    def recover_running_jobs(self) -> int:
+        """Tras una caída: lo que quedó `running` vuelve a `pending`."""
+        with self.db:
+            cur = self.db.execute(
+                "UPDATE jobs SET status='pending', started_at=NULL WHERE status='running'")
+        return cur.rowcount
+
+    def retry_jobs(self, *, status: str | None = None, job_id: int | None = None) -> int:
+        """Devuelve a `pending` los trabajos de un estado (failed/skipped) o uno concreto."""
+        where, params = ("id=? AND status != 'running'", [job_id]) if job_id is not None else (
+            "status=?", [status])
+        with self.db:
+            cur = self.db.execute(
+                f"""UPDATE jobs SET status='pending', attempts=0, last_error=NULL, notes=NULL,
+                    started_at=NULL, finished_at=NULL WHERE {where}""", params)
+        return cur.rowcount
+
+    def remove_job(self, job_id: int) -> bool:
+        with self.db:
+            cur = self.db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        return cur.rowcount > 0
+
+    def clear_done_jobs(self) -> int:
+        """Borra de la cola los trabajos terminados. No toca transcripciones ni afirmaciones."""
+        with self.db:
+            cur = self.db.execute("DELETE FROM jobs WHERE status='done'")
+        return cur.rowcount
 
     # -- consulta (lo que verán los agentes) ---------------------------------
 

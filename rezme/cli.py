@@ -1,4 +1,4 @@
-"""CLI de reZme fase 2:  python -m rezme {ingest,extract,claims,eval,stats,search} ..."""
+"""CLI de reZme fase 2:  python -m rezme {ingest,extract,claims,eval,queue,stats,search} ..."""
 from __future__ import annotations
 
 import argparse
@@ -187,6 +187,158 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 0 if any(r["estado"] == "ok" for r in reports) else 1
 
 
+def cmd_queue_add(args: argparse.Namespace) -> int:
+    from . import batch
+
+    urls = list(args.urls)
+    try:
+        if args.file:
+            urls += batch.read_urls(Path(args.file).read_text(encoding="utf-8").splitlines())
+        if args.stdin:
+            urls += batch.read_urls(sys.stdin)
+    except OSError as exc:
+        print(f"No se pudo leer el fichero: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    if not urls:
+        print("Indica al menos una URL, o usa --file o --stdin.", file=sys.stderr)
+        return 1
+    with Store(db_path(args.db)) as store:
+        try:
+            report = batch.add_urls(store, urls, priority=args.priority,
+                                    whole_playlist=args.playlist, cookies_from=args.cookies_from)
+        except Exception as exc:  # yt-dlp al expandir una lista
+            print(f"No se pudo leer la lista: {batch.classify_error(exc)[1]}", file=sys.stderr)
+            return 1
+    line = f"✓ {report.added} añadidos · {report.already} ya estaban"
+    if report.queued_for_extract:
+        line += f" ({report.queued_for_extract} ya ingeridos quedan en cola solo para extracción)"
+    line += f" · {len(report.inaccessible)} no accesibles"
+    print(line)
+    for name, reason in report.inaccessible:
+        print(f"  ✗ {name}: {reason}")
+    for raw in report.invalid:
+        print(f"  ✗ URL no válida: {raw}", file=sys.stderr)
+    return 1 if report.invalid and not (report.added or report.already) else 0
+
+
+def cmd_queue_run(args: argparse.Namespace) -> int:
+    from . import batch
+
+    if args.no_whisper and args.whisper_only:
+        print("--no-whisper y --whisper-only son incompatibles.", file=sys.stderr)
+        return 1
+    deps = batch.Deps()
+    if args.stage == "all":
+        try:
+            from .backends import check_backend
+            problem = check_backend(args.backend)
+        except ImportError:
+            problem = None
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+        deps.extractor = batch.load_extractor(
+            args.backend, domain=None if args.domain == "auto" else args.domain,
+            ollama_model=args.ollama_model)
+        if deps.extractor is None:
+            print("La extracción aún no está disponible: se ejecuta solo la ingesta.",
+                  file=sys.stderr)
+    langs = [l.strip() for l in args.lang.split(",") if l.strip()]
+    with Store(db_path(args.db)) as store:
+        summary = batch.run_queue(
+            store, limit=args.limit, delay=args.delay, stage=args.stage,
+            no_whisper=args.no_whisper, whisper_only=args.whisper_only, langs=langs,
+            whisper_model=args.whisper_model, cookies_from=args.cookies_from, deps=deps,
+            out=lambda msg: print(msg, flush=True))
+    print(batch.format_summary(summary))
+    return 130 if summary.interrupted else 0
+
+
+_STATUS_LABELS = {"pending": "pendientes", "running": "en curso", "done": "hechos",
+                  "failed": "fallidos", "skipped": "saltados"}
+
+
+def _job_line(job: dict) -> str:
+    line = (f"#{job['id']} [{job['status']}/{job['stage']}] {job['title'] or job['video_id']} "
+            f"· {job['url']}")
+    if job["priority"]:
+        line += f" · prioridad {job['priority']}"
+    if job["last_error"]:
+        line += f" · {job['last_error']}"
+    elif job["notes"]:
+        line += f" · {job['notes']}"
+    return line
+
+
+def cmd_queue_status(args: argparse.Namespace) -> int:
+    with Store(db_path(args.db)) as store:
+        counts = store.job_counts()
+        pending = store.pending_jobs(limit=5)
+        failed = store.list_jobs("failed")[-5:]
+    if not counts:
+        print("La cola está vacía.")
+        return 0
+    for status, label in _STATUS_LABELS.items():
+        ingest, extract = counts.get(f"{status}/ingest", 0), counts.get(f"{status}/extract", 0)
+        if status == "pending":
+            print(f"pendientes: {ingest} de ingesta · {extract} de extracción")
+        else:
+            print(f"{label}: {ingest + extract}")
+    if pending:
+        print("Próximos:")
+        for job in pending:
+            print("  " + _job_line(job))
+    if failed:
+        print("Últimos errores:")
+        for job in failed:
+            print("  " + _job_line(job))
+    return 0
+
+
+def cmd_queue_list(args: argparse.Namespace) -> int:
+    with Store(db_path(args.db)) as store:
+        jobs = store.list_jobs(args.status)
+    for job in jobs:
+        print(_job_line(job))
+    if not jobs:
+        print("Sin trabajos.", file=sys.stderr)
+    return 0
+
+
+def cmd_queue_retry(args: argparse.Namespace) -> int:
+    chosen = [bool(args.failed), bool(args.skipped), args.id is not None]
+    if sum(chosen) != 1:
+        print("Indica --failed, --skipped o el ID de un trabajo.", file=sys.stderr)
+        return 1
+    with Store(db_path(args.db)) as store:
+        if args.id is not None:
+            n = store.retry_jobs(job_id=args.id)
+        else:
+            n = store.retry_jobs(status="failed" if args.failed else "skipped")
+    print(f"✓ {n} trabajos vuelven a la cola.")
+    return 0 if n or args.id is None else 1
+
+
+def cmd_queue_remove(args: argparse.Namespace) -> int:
+    with Store(db_path(args.db)) as store:
+        removed = store.remove_job(args.id)
+    if not removed:
+        print(f"El trabajo {args.id} no existe.", file=sys.stderr)
+        return 1
+    print(f"✓ Trabajo {args.id} quitado de la cola (lo ya guardado en la base no se toca).")
+    return 0
+
+
+def cmd_queue_clear(args: argparse.Namespace) -> int:
+    if not args.done:
+        print("Indica --done: solo se pueden limpiar los trabajos terminados.", file=sys.stderr)
+        return 1
+    with Store(db_path(args.db)) as store:
+        n = store.clear_done_jobs()
+    print(f"✓ {n} trabajos terminados quitados de la cola. Transcripciones y afirmaciones intactas.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="rezme", description="Base de conocimiento de reZme (fase 2).")
     p.add_argument("--db", help="Ruta de la base SQLite (o variable REZME_DB)")
@@ -231,6 +383,59 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("path", nargs="?", help="Fichero o carpeta de expectativas")
     e.add_argument("--json", action="store_true")
     e.set_defaults(func=cmd_eval)
+
+    queue = sub.add_parser("queue", parents=[common], help="Cola de procesamiento por lotes")
+    qsub = queue.add_subparsers(dest="queue_cmd", required=True)
+
+    qa = qsub.add_parser("add", parents=[common], help="Encolar URLs o listas de reproducción")
+    qa.add_argument("urls", nargs="*", metavar="URL")
+    qa.add_argument("--file", metavar="FICHERO", help="Una URL por línea; # para comentarios")
+    qa.add_argument("--stdin", action="store_true", help="Leer URLs de la entrada estándar")
+    qa.add_argument("--priority", type=int, default=0, help="Mayor número = antes")
+    qa.add_argument("--playlist", action="store_true",
+                    help="Expandir la lista entera aunque la URL sea de un vídeo con list=")
+    qa.add_argument("--cookies-from", metavar="NAVEGADOR", help="Para listas privadas")
+    qa.set_defaults(func=cmd_queue_add)
+
+    qr = qsub.add_parser("run", parents=[common], help="Procesar la cola, vídeo a vídeo")
+    qr.add_argument("--limit", type=int, metavar="N", help="Máximo de vídeos en esta pasada")
+    qr.add_argument("--delay", type=float, metavar="SEG",
+                    help="Pausa entre vídeos (por defecto, 5-10 s al azar)")
+    qr.add_argument("--stage", default="ingest", choices=["ingest", "all"],
+                    help="ingest = solo transcripción; all = también extracción y verificación")
+    qr.add_argument("--no-whisper", action="store_true",
+                    help="No transcribir audio: los vídeos sin subtítulos quedan saltados")
+    qr.add_argument("--whisper-only", action="store_true",
+                    help="Procesar solo los saltados por falta de subtítulos, con Whisper")
+    qr.add_argument("--whisper-model", default="small")
+    qr.add_argument("--cookies-from", metavar="NAVEGADOR")
+    qr.add_argument("--lang", default="es,en")
+    qr.add_argument("--backend", default="claude-code", choices=["claude-code", "api", "ollama"])
+    qr.add_argument("--ollama-model", default="qwen3:14b")
+    qr.add_argument("--domain", default="auto",
+                    choices=["auto", "macro", "empresa", "ciencia", "cripto"])
+    qr.set_defaults(func=cmd_queue_run)
+
+    qs = qsub.add_parser("status", parents=[common], help="Recuento, próximos y últimos errores")
+    qs.set_defaults(func=cmd_queue_status)
+
+    ql = qsub.add_parser("list", parents=[common], help="Listar trabajos")
+    ql.add_argument("--status", choices=["pending", "running", "done", "failed", "skipped"])
+    ql.set_defaults(func=cmd_queue_list)
+
+    qt = qsub.add_parser("retry", parents=[common], help="Devolver trabajos a la cola")
+    qt.add_argument("id", nargs="?", type=int, metavar="ID")
+    qt.add_argument("--failed", action="store_true")
+    qt.add_argument("--skipped", action="store_true")
+    qt.set_defaults(func=cmd_queue_retry)
+
+    qm = qsub.add_parser("remove", parents=[common], help="Quitar un trabajo de la cola")
+    qm.add_argument("id", type=int, metavar="ID")
+    qm.set_defaults(func=cmd_queue_remove)
+
+    qc = qsub.add_parser("clear", parents=[common], help="Limpiar trabajos terminados")
+    qc.add_argument("--done", action="store_true")
+    qc.set_defaults(func=cmd_queue_clear)
 
     s = sub.add_parser("stats", parents=[common], help="Recuento de registros")
     s.set_defaults(func=cmd_stats)

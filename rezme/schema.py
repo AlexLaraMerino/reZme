@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CLAIM_TYPES = (
     "fact", "statistic", "study_result", "causal_claim", "forecast", "opinion",
@@ -37,6 +37,8 @@ DIRECTIONS = ("positive", "negative", "mixed", "unclear")
 IMPLICATION_BASES = ("stated_by_source", "inferred_by_system")
 TRANSCRIPT_ORIGINS = ("subtitles_manual", "subtitles_auto", "whisper", "pasted")
 FORECAST_RESOLUTIONS = ("pending", "correct", "incorrect", "partial", "void")
+JOB_STATUSES = ("pending", "running", "done", "failed", "skipped")
+JOB_STAGES = ("ingest", "extract")
 
 # Caducidad por defecto (días desde la fecha de la fuente). None = no caduca.
 # Son valores iniciales ajustables: un dato estadístico envejece antes que un

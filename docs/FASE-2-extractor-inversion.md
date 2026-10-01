@@ -173,3 +173,18 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   se leen los campos del esquema (lista blanca) y `attrs` admite solo pares
   clave–valor simples.
 
+## 9. Cola de procesamiento por lotes (esquema v3)
+
+`python -m rezme queue add|run|status|list|retry|remove|clear --done`. Tabla
+`jobs`, un trabajo por vídeo, que avanza de `ingest` a `extract`.
+
+- `queue run` solo ingiere por defecto; `--stage all` añade extracción y
+  verificación. Un vídeo ingerido queda `pending` en la etapa `extract`.
+- Errores permanentes (privado, eliminado, de pago, edad) no se reintentan; los
+  transitorios, hasta 3 intentos con esperas de 30 s y 120 s.
+- Tres vídeos seguidos rechazados por YouTube (429 o anti-bot) detienen el lote
+  y vuelven a la cola. Cualquier otro fallo no detiene nada.
+- `--no-whisper` deja los vídeos sin subtítulos como `skipped`;
+  `--whisper-only` los recupera.
+- La cola no guarda secretos: ni el navegador de las cookies ni parámetros de URL.
+
