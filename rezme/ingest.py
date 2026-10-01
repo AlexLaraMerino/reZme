@@ -1,8 +1,9 @@
 """Ingesta: URL de YouTube -> fuente + transcripción cruda persistida.
 
-Reutiliza la descarga y la transcripción de `yt_digest`. Lo nuevo es que
-guarda los cues originales (con segundos), los metadatos y el origen del texto,
-y que es idempotente: una URL ya ingerida no vuelve a descargarse.
+Reutiliza el formato de subtítulos y la transcripción de `yt_digest`. Lo nuevo
+es que guarda los cues originales (con segundos), los metadatos y el origen del
+texto, que prefiere los subtítulos en el idioma original del vídeo y que es
+idempotente: una URL ya ingerida no vuelve a descargarse.
 """
 from __future__ import annotations
 
@@ -52,16 +53,82 @@ def video_id_from_url(url: str) -> str | None:
     return candidate if _ID_RE.match(candidate) else None
 
 
+class SubtitleDownloadError(RuntimeError):
+    """El vídeo tiene subtítulos pero su descarga ha fallado. Conserva los metadatos."""
+
+    def __init__(self, info: dict[str, Any], message: str):
+        super().__init__(message)
+        self.info = info
+
+
+def _json3(tracks: Sequence[dict[str, Any]] | None) -> dict[str, Any] | None:
+    return next((t for t in tracks or [] if t.get("ext") == "json3"), None)
+
+
+def _is_translation(track: dict[str, Any]) -> bool:
+    return "tlang=" in str(track.get("url") or "")
+
+
+def choose_track(info: dict[str, Any],
+                 langs: Sequence[str]) -> tuple[dict[str, Any], str, str] | None:
+    """Mejor pista de subtítulos: (pista json3, origen, idioma), o None si no hay.
+
+    Orden: subtítulos manuales en los idiomas pedidos; automáticos en el idioma
+    original del vídeo; y solo al final las traducciones automáticas, que son
+    peores y que YouTube limita con errores 429.
+    """
+    langs = list(langs)
+    manual = info.get("subtitles") or {}
+    for lang in yt_digest.matching_langs(manual, langs):
+        track = _json3(manual.get(lang))
+        if track:
+            return track, "subtitles_manual", lang
+    auto = info.get("automatic_captions") or {}
+    originals = {lang: track for lang in auto
+                 if (track := _json3(auto[lang])) and not _is_translation(track)}
+    preferred = yt_digest.matching_langs(originals, langs)
+    spoken = str(info.get("language") or "").split("-")[0]
+    native = [l for l in originals if l.endswith("-orig") or (spoken and l.split("-")[0] == spoken)]
+    for lang in [*preferred, *native, *originals]:
+        return originals[lang], "subtitles_auto", lang.removesuffix("-orig")
+    for lang in yt_digest.matching_langs(auto, langs):
+        track = _json3(auto.get(lang))
+        if track:
+            return track, "subtitles_auto", lang
+    return None
+
+
 def subtitle_origin(info: dict[str, Any], langs: Sequence[str]) -> tuple[str, str | None]:
-    """Replica la elección de `yt_digest.choose_subtitle_track` para saber si el
-    texto vino de subtítulos manuales (más fiables) o automáticos."""
-    for source, origin in (("subtitles", "subtitles_manual"),
-                           ("automatic_captions", "subtitles_auto")):
-        by_lang = info.get(source) or {}
-        for lang in yt_digest.matching_langs(by_lang, list(langs)):
-            if any(t.get("ext") == "json3" for t in by_lang.get(lang, [])):
-                return origin, lang
-    return "subtitles_auto", None
+    """Origen (manual o automático) e idioma de la pista que se elige para el vídeo."""
+    chosen = choose_track(info, langs)
+    return (chosen[1], chosen[2]) if chosen else ("subtitles_auto", None)
+
+
+def fetch_subtitles(url: str, langs: Sequence[str], tmpdir: str,
+                    cookies_from: str | None) -> tuple[dict[str, Any], Cues]:
+    """Metadatos y cues del vídeo. Misma firma que `yt_digest.fetch_subtitles`.
+
+    A diferencia de aquella, elige la pista con `choose_track`, la descarga con
+    la sesión de yt-dlp (cookies incluidas) y no oculta los fallos: si la pista
+    existe y no se puede descargar lanza `SubtitleDownloadError`.
+    """
+    from yt_dlp import YoutubeDL
+
+    opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "skip_download": True,
+                            "noplaylist": True, "socket_timeout": 30}
+    if cookies_from:
+        opts["cookiesfrombrowser"] = (cookies_from,)
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        chosen = choose_track(info, langs)
+        if not chosen:
+            return info, []
+        try:
+            raw = ydl.urlopen(chosen[0]["url"]).read().decode("utf-8")
+        except Exception as exc:
+            raise SubtitleDownloadError(
+                info, f"hay subtítulos pero no se pudieron descargar ({exc})") from None
+    return info, yt_digest.parse_json3_text(raw)
 
 
 def upload_date(info: dict[str, Any]) -> str | None:
@@ -86,7 +153,7 @@ def ingest_url(store: Store, url: str, langs: Sequence[str] = ("es", "en"), *,
             return IngestResult(existing["id"], transcript["id"], video_id, transcript["origin"],
                                 transcript["n_cues"], skipped_download=True, new_transcript=False)
 
-    fetch = fetch or yt_digest.fetch_subtitles
+    fetch = fetch or fetch_subtitles
     transcribe = transcribe or yt_digest.transcribe_audio
     langs = list(langs)
 

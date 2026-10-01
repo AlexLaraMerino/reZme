@@ -228,7 +228,7 @@ def cmd_queue_run(args: argparse.Namespace) -> int:
         print("--no-whisper y --whisper-only son incompatibles.", file=sys.stderr)
         return 1
     deps = batch.Deps()
-    if args.stage == "all":
+    if args.stage != "ingest":
         try:
             from .backends import check_backend
             problem = check_backend(args.backend)
@@ -401,8 +401,9 @@ def main(argv: list[str] | None = None) -> int:
     qr.add_argument("--limit", type=int, metavar="N", help="Máximo de vídeos en esta pasada")
     qr.add_argument("--delay", type=float, metavar="SEG",
                     help="Pausa entre vídeos (por defecto, 5-10 s al azar)")
-    qr.add_argument("--stage", default="ingest", choices=["ingest", "all"],
-                    help="ingest = solo transcripción; all = también extracción y verificación")
+    qr.add_argument("--stage", default="ingest", choices=["ingest", "extract", "all"],
+                    help="ingest = solo transcripción; extract = solo extracción de lo ya "
+                         "guardado; all = ambas")
     qr.add_argument("--no-whisper", action="store_true",
                     help="No transcribir audio: los vídeos sin subtítulos quedan saltados")
     qr.add_argument("--whisper-only", action="store_true",

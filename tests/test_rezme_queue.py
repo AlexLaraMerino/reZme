@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from rezme import SCHEMA_VERSION, Store, batch, cli
+from rezme import ingest as ing
 from rezme.schema import ValidationError
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -246,6 +247,62 @@ class AddTests(QueueBase):
         self.assertEqual(batch.read_urls(text.splitlines()), [url(IDS[0]), url(IDS[1])])
 
 
+class TrackTests(unittest.TestCase):
+    def track(self, translated=False):
+        return [{"ext": "vtt", "url": "v"}, {"ext": "json3", "url": "u&tlang=es" if translated else "u"}]
+
+    def test_prefers_manual_then_original_language_over_translations(self):
+        english = {"language": "en-US", "automatic_captions": {
+            "es": self.track(translated=True), "en": self.track(translated=True),
+            "en-orig": self.track()}}
+        self.assertEqual(ing.choose_track(english, ["es", "en"])[1:], ("subtitles_auto", "en"))
+        self.assertEqual(ing.subtitle_origin(english, ["es", "en"]), ("subtitles_auto", "en"))
+        manual = dict(english, subtitles={"es-419": self.track()})
+        self.assertEqual(ing.choose_track(manual, ["es", "en"])[1:], ("subtitles_manual", "es-419"))
+        german = {"language": "de", "automatic_captions": {"es": self.track(True), "de": self.track()}}
+        self.assertEqual(ing.choose_track(german, ["es", "en"])[1:], ("subtitles_auto", "de"))
+        only_translated = {"automatic_captions": {"es": self.track(True)}}
+        self.assertEqual(ing.choose_track(only_translated, ["es", "en"])[1:], ("subtitles_auto", "es"))
+        self.assertIsNone(ing.choose_track({"automatic_captions": {"es": [{"ext": "vtt"}]}}, ["es"]))
+
+    def test_fetch_downloads_with_ytdlp_session_and_reports_failures(self):
+        video = {"title": "T", "language": "en", "automatic_captions": {
+            "es": self.track(translated=True), "en-orig": self.track()}}
+        body = '{"events": [{"tStartMs": 1500, "segs": [{"utf8": "hello"}]}]}'
+        seen = {}
+
+        class FakeYDL:
+            fail = False
+
+            def __init__(self, opts):
+                seen["opts"] = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, video_url, download):
+                return video
+
+            def urlopen(self, track_url):
+                seen["url"] = track_url
+                if self.fail:
+                    raise RuntimeError("HTTP Error 429: Too Many Requests")
+                return io.BytesIO(body.encode())
+
+        with mock.patch.dict("sys.modules", {"yt_dlp": SimpleNamespace(YoutubeDL=FakeYDL)}):
+            got, cues = ing.fetch_subtitles(url(IDS[0]), ["es", "en"], "/tmp", "safari")
+            self.assertEqual((cues, seen["url"]), ([(1.5, "hello")], "u"))  # la pista original
+            self.assertEqual(seen["opts"]["cookiesfrombrowser"], ("safari",))
+            FakeYDL.fail = True
+            with self.assertRaises(ing.SubtitleDownloadError) as caught:
+                ing.fetch_subtitles(url(IDS[0]), ["es", "en"], "/tmp", None)
+            self.assertEqual(caught.exception.info["title"], "T")
+            self.assertEqual(batch.classify_error(caught.exception)[0], "blocked")
+
+
 class RunTests(QueueBase):
     def test_order_priority_progress_and_pauses(self):
         for i, video_id in enumerate(IDS[:3]):
@@ -332,6 +389,39 @@ class RunTests(QueueBase):
         self.run_queue(no_whisper=True)
         self.assertEqual(self.statuses()[IDS[0]], ("pending", "extract"))
         self.assertEqual((self.world.transcribed, self.world.sleeps), ([], [30.0]))
+
+    def test_undownloadable_subtitles_fall_back_to_whisper_on_last_try(self):
+        self.world.videos[IDS[0]] = (info("Pista bloqueada"), [])  # siempre vacía
+        self.add(IDS[0])
+        summary = self.run_queue()
+        self.assertEqual((len(self.world.fetches), self.world.sleeps), (3, [30.0, 120.0]))
+        self.assertEqual(self.world.transcribed, [IDS[0]])
+        self.assertEqual(self.lines[-1], "[1/1] Pista bloqueada · ingesta ok · 1 cues · Whisper")
+        self.assertEqual((summary.ingested, summary.failed), (1, 0))
+
+    def test_undownloadable_subtitles_without_whisper_are_skipped_for_later(self):
+        self.world.videos[IDS[0]] = ing.SubtitleDownloadError(info("Pista bloqueada"),
+                                                              "HTTP Error 429: Too Many Requests")
+        self.add(IDS[0])
+        summary = self.run_queue(no_whisper=True)
+        job = self.store.list_jobs()[0]
+        self.assertEqual((job["status"], job["notes"]), ("skipped", batch.NO_SUBS_NOTE))
+        self.assertEqual((summary.skipped, summary.failed, summary.blocked), (1, 0, False))
+        self.assertIn("los subtítulos no se pudieron descargar", self.lines[-1])
+        self.run_queue(whisper_only=True)
+        self.assertEqual(self.world.transcribed, [IDS[0]])
+        self.assertEqual(self.statuses()[IDS[0]], ("pending", "extract"))
+
+    def test_extract_stage_only_touches_saved_videos(self):
+        self.ok(IDS[0])
+        self.ok(IDS[1])
+        self.add(IDS[0], IDS[1])
+        self.run_queue(limit=1)
+        self.lines.clear()
+        summary = self.run_queue(stage="extract", extractor=True)
+        self.assertEqual((summary.done, summary.remaining), (1, 0))
+        self.assertEqual(self.world.fetches, [IDS[0]])  # no ingiere el que faltaba
+        self.assertEqual(self.statuses(), {IDS[0]: ("done", "extract"), IDS[1]: ("pending", "ingest")})
 
     def test_youtube_blocking_stops_the_batch_and_requeues(self):
         for video_id in IDS[:4]:

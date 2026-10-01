@@ -20,11 +20,14 @@ from urllib.parse import parse_qs, urlparse
 
 import yt_digest
 
-from .ingest import PLATFORM, _YT_HOSTS, ingest_url, video_id_from_url
+from .backends import BackendUnavailable
+from .ingest import (PLATFORM, _YT_HOSTS, SubtitleDownloadError, choose_track, fetch_subtitles,
+                     ingest_url, video_id_from_url)
 from .schema import utc_now
 from .store import Store
 
 NO_SUBS_NOTE = "sin subtítulos (pendiente de Whisper)"
+STAGES = {"ingest": ("ingest",), "extract": ("extract",), "all": ("ingest", "extract")}
 MAX_ATTEMPTS = 3
 BACKOFF_S = (30.0, 120.0)        # espera antes del 2.º y del 3.er intento
 DEFAULT_DELAY_S = (5.0, 10.0)    # pausa entre vídeos si no se indica --delay
@@ -96,7 +99,7 @@ def classify_error(exc: BaseException) -> tuple[str, str]:
     for mark, reason in _PERMANENT:
         if mark in low:
             return "permanent", reason
-    if isinstance(exc, TransientError):
+    if isinstance(exc, (TransientError, SubtitleDownloadError)):
         return "transient", message
     if isinstance(exc, (OSError, TimeoutError)) or any(mark in low for mark in _TRANSIENT):
         return "transient", f"error de red ({message})"
@@ -256,6 +259,7 @@ class RunSummary:
     recovered: int = 0
     interrupted: bool = False
     blocked: bool = False
+    stopped: str | None = None  # motivo si el lote se detuvo por falta de acceso al modelo
     seconds: float = 0.0
     remaining: int = 0
 
@@ -283,19 +287,27 @@ def _elapsed(seconds: float) -> str:
 
 def _process(store: Store, job: dict[str, Any], *, stage: str, langs: Sequence[str],
              no_whisper: bool, whisper: bool, whisper_model: str, cookies_from: str | None,
-             deps: Deps) -> tuple[list[str], bool, bool]:
+             last_try: bool, deps: Deps) -> tuple[list[str], bool, bool]:
     """Ejecuta las etapas pendientes del trabajo. Devuelve (partes del mensaje, terminado, usó red)."""
     parts: list[str] = []
     network = False
     if job["stage"] == "ingest":
-        base_fetch = deps.fetch or yt_digest.fetch_subtitles
+        base_fetch = deps.fetch or fetch_subtitles
         base_transcribe = deps.transcribe or yt_digest.transcribe_audio
 
         def fetch(url: str, lang_list: list[str], tmp: str, cookies: str | None):
-            info, cues = base_fetch(url, lang_list, tmp, cookies)
-            # yt_digest devuelve [] tanto si no hay subtítulos como si falló su descarga.
-            if not cues and not whisper and yt_digest.choose_subtitle_track(info, lang_list):
-                raise TransientError("hay subtítulos pero no se pudieron descargar")
+            try:
+                info, cues = base_fetch(url, lang_list, tmp, cookies)
+                # yt_digest devuelve [] tanto si no hay subtítulos como si falló su descarga.
+                if not cues and choose_track(info, lang_list):
+                    raise SubtitleDownloadError(info, "hay subtítulos pero no se pudieron descargar")
+            except SubtitleDownloadError as exc:
+                if whisper or (last_try and not no_whisper):
+                    return exc.info, []  # último recurso: transcribir el audio
+                if last_try:
+                    raise NoSubtitles("los subtítulos no se pudieron descargar "
+                                      "(pendiente de Whisper)") from None
+                raise
             return info, cues
 
         def transcribe(*args: Any):
@@ -315,8 +327,8 @@ def _process(store: Store, job: dict[str, Any], *, stage: str, langs: Sequence[s
                          notes=None)
         job["stage"], job["title"] = "extract", source.get("title") or job["title"]
 
-    if stage != "all" or deps.extractor is None:
-        if stage == "all":
+    if stage == "ingest" or deps.extractor is None:
+        if stage != "ingest":
             parts.append("extracción pendiente (aún no disponible)")
         return parts, False, network
 
@@ -343,8 +355,8 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
     `on_change` se llama cuando un trabajo empieza o termina (para refrescar una interfaz).
     """
     changed = on_change or (lambda: None)
-    if stage not in ("ingest", "all"):
-        raise ValueError(f"Etapa no válida: {stage!r} (permitidas: ingest, all).")
+    if stage not in STAGES:
+        raise ValueError(f"Etapa no válida: {stage!r} (permitidas: {', '.join(STAGES)}).")
     deps = deps or Deps()
     summary = RunSummary(recovered=store.recover_running_jobs())
     if summary.recovered:
@@ -353,7 +365,7 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
     def candidates() -> list[dict[str, Any]]:
         if whisper_only:
             return store.pending_jobs(stages=("ingest",), status="skipped", notes=NO_SUBS_NOTE)
-        return store.pending_jobs(stages=("ingest", "extract") if stage == "all" else ("ingest",))
+        return store.pending_jobs(stages=STAGES[stage])
 
     total = len(candidates())
     if limit is not None:
@@ -382,12 +394,19 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
                     parts, finished, network = _process(
                         store, job, stage=stage, langs=langs, no_whisper=no_whisper,
                         whisper=whisper_only, whisper_model=whisper_model,
-                        cookies_from=cookies_from, deps=deps)
+                        cookies_from=cookies_from, last_try=tries >= MAX_ATTEMPTS, deps=deps)
                 except KeyboardInterrupt:
                     # El trabajo en curso queda limpio: vuelve a la cola sin contar el intento.
                     store.update_job(job["id"], status="pending", started_at=None,
                                      attempts=job["attempts"] + tries - 1)
                     raise
+                except BackendUnavailable as exc:
+                    # No es culpa del vídeo: vuelve a la cola y se detiene el lote.
+                    store.update_job(job["id"], status="pending", started_at=None,
+                                     attempts=job["attempts"] + tries - 1)
+                    summary.stopped = sanitize_error(str(exc))
+                    out(f"{tag} {name} · detenido · {summary.stopped}")
+                    break
                 except NoSubtitles as exc:
                     store.update_job(job["id"], status="skipped", notes=NO_SUBS_NOTE,
                                      finished_at=utc_now())
@@ -426,6 +445,8 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
                     break
 
             changed()
+            if summary.stopped:
+                break
             if len(blocked_streak) >= MAX_BLOCKED_STREAK:
                 for job_id in blocked_streak:  # no fue culpa de esos vídeos
                     store.retry_jobs(job_id=job_id)
@@ -446,8 +467,7 @@ def run_queue(store: Store, *, limit: int | None = None, delay: float | None = N
         store.recover_running_jobs()
         out("Interrumpido: el vídeo en curso vuelve a la cola.")
     summary.seconds = deps.clock() - started
-    summary.remaining = len(store.pending_jobs(
-        stages=("ingest", "extract") if stage == "all" else ("ingest",)))
+    summary.remaining = len(store.pending_jobs(stages=STAGES[stage]))
     return summary
 
 
