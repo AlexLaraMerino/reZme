@@ -1,5 +1,35 @@
 import SwiftUI
 import AppKit
+import Security
+
+/// La clave de la API se guarda en el Llavero de macOS, nunca en disco en claro.
+enum KeyStore {
+    private static let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.almatechnologies.rezme",
+        kSecAttrAccount as String: "meta-api-key",
+    ]
+    static func load() -> String {
+        var search = query
+        search[kSecReturnData as String] = true
+        search[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(search as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+    @discardableResult static func save(_ key: String) -> Bool {
+        let data = Data(key.utf8)
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var item = query
+            item[kSecValueData as String] = data
+            return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+        }
+        return status == errSecSuccess
+    }
+    static func delete() { SecItemDelete(query as CFDictionary) }
+}
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -17,10 +47,26 @@ final class AppModel: ObservableObject {
     @Published var options = false
     var process: Process?
     var generation = UUID()
+    private var savedKey = ""
+    private var keyLoaded = false
+
+    /// Lee la clave guardada la primera vez que hace falta (no al abrir la app).
+    func loadKey() {
+        guard !keyLoaded else { return }
+        keyLoaded = true
+        savedKey = KeyStore.load()
+        if key.isEmpty { key = savedKey }
+    }
+    func forgetKey() {
+        KeyStore.delete()
+        key = ""; savedKey = ""; keyLoaded = true
+        status = "Clave eliminada del Llavero."; error = false
+    }
 
     func start() {
         guard !busy else { return }
         error = false
+        if mode == "api" { loadKey() }
         guard let address = URL(string: url.trimmingCharacters(in: .whitespacesAndNewlines)),
               ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"].contains(address.host ?? ""),
               ["http", "https"].contains(address.scheme ?? "") else {
@@ -28,6 +74,13 @@ final class AppModel: ObservableObject {
         }
         if mode == "api" && key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             options = true; status = "Introduce tu clave de Meta en las opciones."; error = true; return
+        }
+        if mode == "api" {
+            let current = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            if current != savedKey {
+                if KeyStore.save(current) { savedKey = current }
+                else { status = "No se pudo guardar la clave en el Llavero; se usará solo en esta sesión." }
+            }
         }
         guard let resources = Bundle.main.resourceURL else {
             status = "No se encuentra el entorno de la aplicación."; error = true; return
@@ -135,7 +188,11 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         if app.mode == "api" {
                             SecureField("Clave API de Meta", text: $app.key).textFieldStyle(.roundedBorder)
-                            Text("La clave solo se conserva mientras la app está abierta.").font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                Text("La clave se guarda en el Llavero de macOS.").font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Olvidar", action: app.forgetKey).controlSize(.small).disabled(app.key.isEmpty || app.busy)
+                            }
                             TextField("Modelo", text: $app.model).textFieldStyle(.roundedBorder)
                         }
                         Picker("Sesión de YouTube", selection: $app.browser) {
@@ -196,7 +253,7 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in app.cancel() }
     }
     func modeButton(_ value: String, _ title: String, _ subtitle: String, _ icon: String) -> some View {
-        Button { app.mode = value } label: {
+        Button { app.mode = value; if value == "api" { app.loadKey() } } label: {
             HStack(spacing: 12) {
                 Image(systemName: icon).font(.title3).frame(width: 23)
                 VStack(alignment: .leading, spacing: 4) { Text(title).font(.system(size: 14, weight: .semibold)); Text(subtitle).font(.caption).foregroundStyle(.secondary) }
