@@ -581,6 +581,68 @@ class ExtractTests(ExtractBase):
         self.assertNotIn("{{", system)
         self.assertNotIn(": null", system)
 
+    def long_transcript(self):
+        cues = [(i * 20.0, f"frase número {i} del vídeo de prueba") for i in range(60)]  # 20 min: 4 tramos
+        self.store.save_transcript(self.src, cues, "whisper")
+        return cues
+
+    def test_chunks_run_in_parallel_and_are_stored_in_order(self):
+        import threading
+        import time
+        self.long_transcript()
+        active, peak, lock = [0], [0], threading.Lock()
+
+        def slow(system, user):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with lock:
+                active[0] -= 1
+            number = user.split("Tramo ")[1].split(" ")[0]
+            return response(claim_json(statement=f"Idea del tramo {number}.", metric_value=None,
+                                       quote=f"frase número {(int(number) - 1) * 15} del vídeo de prueba"))
+
+        lines = []
+        backend = bk.Backend("falso", "m1", slow)
+        started = time.monotonic()
+        result = ex.extract_source(self.store, self.src, backend, workers=3, progress=lines.append)
+        elapsed = time.monotonic() - started
+        self.assertEqual((result.chunks, result.chunks_processed, result.verified), (4, 4, 4))
+        self.assertEqual(peak[0], 3)             # tres llamadas a la vez, no más
+        self.assertLess(elapsed, 0.05 * 4)       # y por tanto más rápido que una a una
+        self.assertIn("4 tramos, 3 a la vez", lines[0])
+        statements = [c["statement"] for c in sorted(self.claims(), key=lambda c: c["id"])]
+        self.assertEqual(statements, [f"Idea del tramo {n}." for n in range(1, 5)])  # guardados en orden
+        again = ex.extract_source(self.store, self.src, backend, workers=3)
+        self.assertEqual((again.chunks_skipped, again.llm_calls), (4, 0))
+
+    def test_parallel_failures_are_recorded_and_access_errors_stop_everything(self):
+        self.long_transcript()
+        calls = []
+
+        def flaky(system, user):
+            number = int(user.split("Tramo ")[1].split(" ")[0])
+            calls.append(number)
+            if number == 2:
+                raise RuntimeError("timed out")
+            return response()
+
+        result = ex.extract_source(self.store, self.src, bk.Backend("falso", "m1", flaky), workers=2)
+        self.assertEqual((result.chunks_processed, result.chunks_failed), (3, 1))
+        self.assertEqual(self.store.get_run(result.run_id)["stats"]["tramos"]["1"]["error"], "timed out")
+
+        calls.clear()
+        self.store.save_transcript(self.src, self.long_transcript() + [(1300.0, "fin")], "whisper")
+
+        def denied(system, user):
+            calls.append(user)
+            raise bk.BackendUnavailable("La clave API no es válida.")
+
+        with self.assertRaises(bk.BackendUnavailable):
+            ex.extract_source(self.store, self.src, bk.Backend("falso", "m1", denied), workers=2)
+        self.assertLessEqual(len(calls), 2)  # los tramos que aún no habían empezado no se lanzan
+
     def test_missing_source_or_transcript(self):
         with self.assertRaisesRegex(ValueError, "no existe"):
             ex.extract_source(self.store, 999, FakeLLM("").backend())

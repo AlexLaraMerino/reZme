@@ -265,7 +265,8 @@ class RunSummary:
 
 
 def load_extractor(backend_name: str, *, domain: str | None = None,
-                   ollama_model: str = "qwen3:14b") -> Callable[[Store, int], Any] | None:
+                   ollama_model: str = "qwen3:14b",
+                   workers: int = 1) -> Callable[[Store, int], Any] | None:
     """Extractor real, o None si el paquete aún no tiene `extract.py`."""
     try:
         extract = importlib.import_module(f"{__package__}.extract")
@@ -273,7 +274,8 @@ def load_extractor(backend_name: str, *, domain: str | None = None,
     except ImportError:
         return None
     backend = backends.make_backend(backend_name, ollama_model=ollama_model)
-    return lambda store, source_id: extract.extract_source(store, source_id, backend, domain=domain)
+    return lambda store, source_id: extract.extract_source(store, source_id, backend, domain=domain,
+                                                           workers=workers)
 
 
 def _n(value: int) -> str:

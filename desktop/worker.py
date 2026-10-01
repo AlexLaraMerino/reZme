@@ -1,6 +1,7 @@
 """JSON-lines bridge for the macOS app. Secrets only arrive over stdin."""
 import contextlib
 import json
+import os
 import sys
 import tempfile
 import urllib.error
@@ -32,6 +33,10 @@ class MetaAccessError(RuntimeError):
     """Meta rechaza la petición por clave, permisos, modelo o saldo: reintentar no lo arregla."""
 
 
+class MetaBadRequest(RuntimeError):
+    """Meta rechaza la petición por su contenido (400): algún parámetro no le vale."""
+
+
 class MetaRateLimit(RuntimeError):
     """Demasiadas peticiones (429). `retry_after` son los segundos que pide esperar Meta, si lo dice."""
 
@@ -56,6 +61,9 @@ MAX_PACE = 30.0
 _QUOTA_HINTS = ("insufficient", "quota", "billing", "balance", "credit", "payment", "saldo")
 # Pausa entre llamadas de extracción; crece cuando Meta responde 429 y se relaja si todo va bien.
 _pace = {"seconds": 0.0}
+# Si el modelo no admite ajustar el razonamiento, se deja de enviar ese ajuste.
+_reasoning = {"supported": True}
+REASONING_LEVELS = ("low", "medium")
 
 
 def _retry_after(headers):
@@ -65,11 +73,14 @@ def _retry_after(headers):
         return None
 
 
-def _meta_request(messages, key, model, max_tokens, timeout=REPORT_TIMEOUT):
+def _meta_request(messages, key, model, max_tokens, timeout=REPORT_TIMEOUT, reasoning=None):
     """Una petición a Meta. Devuelve la respuesta ya decodificada o lanza un error clasificado."""
+    payload = {"model": model, "messages": messages, "max_completion_tokens": max_tokens}
+    if reasoning:
+        payload["reasoning_effort"] = reasoning
     request = urllib.request.Request(
         META_URL,
-        data=json.dumps({"model": model, "messages": messages, "max_completion_tokens": max_tokens}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
     try:
@@ -90,8 +101,8 @@ def _meta_request(messages, key, model, max_tokens, timeout=REPORT_TIMEOUT):
             if any(hint in detail for hint in _QUOTA_HINTS):
                 raise MetaAccessError("Meta indica que se ha agotado el saldo o la cuota de tu cuenta.") from None
             raise MetaRateLimit("Meta está limitando las peticiones.", _retry_after(error.headers)) from None
-        if error.code == 400 and "token" in detail:
-            raise ValueError("max_tokens") from None
+        if error.code == 400:
+            raise MetaBadRequest(detail) from None
         raise RuntimeError(f"Meta devolvió un error ({error.code}). Inténtalo más tarde.") from None
 
 
@@ -102,7 +113,7 @@ def call_meta(prompt, key, model, system=None, usage=None):
         data = _meta_request(messages, key, model, REPORT_MAX_TOKENS)
     except MetaRateLimit:
         raise MetaAccessError("Meta ha alcanzado el límite de uso o saldo de tu cuenta. Inténtalo más tarde.") from None
-    except ValueError:
+    except MetaBadRequest:
         raise RuntimeError("Meta devolvió un error (400). Inténtalo más tarde.") from None
     if usage is not None and isinstance(data.get("usage"), dict):
         usage.update(data["usage"])
@@ -115,9 +126,11 @@ def call_meta(prompt, key, model, system=None, usage=None):
     return result.strip()
 
 
-def call_meta_extract(system, user, key, model, usage=None, notify=None):
+def call_meta_extract(system, user, key, model, usage=None, notify=None, reasoning=None):
     """Una llamada a Meta para la extracción, paciente con los límites de peticiones.
 
+    - `reasoning` ("low" o "medium") pide al modelo que razone menos antes de escribir, que es
+      donde se le va casi todo el tiempo. Si la API no admite el ajuste, se sigue sin él.
     - Ante un 429 espera lo que diga Meta (o cada vez más) y reintenta; además, deja una pausa
       entre llamadas que crece con cada 429 y se relaja cuando deja de haberlos.
     - Si la respuesta se corta por longitud, la devuelve tal cual: el extractor rescata las
@@ -143,19 +156,27 @@ def call_meta_extract(system, user, key, model, usage=None, notify=None):
                 waited = int(time.monotonic() - started)
                 notify(f"esperando la respuesta del modelo ({waited // 60} min {waited % 60:02d} s)…")
         threading.Thread(target=beat, daemon=True).start()
+        effort = reasoning if reasoning in REASONING_LEVELS and _reasoning["supported"] else None
         try:
-            return _meta_request(messages, key, model, max_tokens, EXTRACT_TIMEOUT)
+            return _meta_request(messages, key, model, max_tokens, EXTRACT_TIMEOUT, effort), effort
         finally:
             done.set()
 
     while True:
         try:
-            data = request()
+            data, _ = request()
             break
-        except ValueError:  # el modelo no admite una respuesta tan larga
-            if max_tokens == REPORT_MAX_TOKENS:
+        except MetaBadRequest as error:
+            detail = str(error)
+            using_effort = reasoning in REASONING_LEVELS and _reasoning["supported"]
+            too_long = "token" in detail and max_tokens != REPORT_MAX_TOKENS
+            if using_effort and ("reason" in detail or not too_long):
+                _reasoning["supported"] = False  # este modelo no deja ajustar el razonamiento
+                notify("El modelo no admite ajustar el razonamiento: sigo con el suyo por defecto.")
+            elif max_tokens != REPORT_MAX_TOKENS:  # tampoco admite una respuesta tan larga
+                max_tokens = REPORT_MAX_TOKENS
+            else:
                 raise RuntimeError("Meta devolvió un error (400). Inténtalo más tarde.") from None
-            max_tokens = REPORT_MAX_TOKENS
         except MetaRateLimit as error:
             _pace["seconds"] = min(max(_pace["seconds"] * 2, 4.0), MAX_PACE)
             if limited >= len(RATE_WAITS):
@@ -271,9 +292,11 @@ def extraction_backend(options):
     """
     from rezme import backends
 
+    import threading
+
     engine = options.get("engine") or "meta"
-    usage = {}
-    # Qué tramo se está procesando, para que los avisos de espera digan a qué vídeo se refieren.
+    reasoning = options.get("reasoning") or None
+    # Qué vídeo se está procesando, para que los avisos de espera digan a cuál se refieren.
     current = {"label": ""}
     notify = lambda message: emit("progress", message=f"{current['label']} · {message}" if current["label"] else message)
     if engine == "meta":
@@ -281,49 +304,53 @@ def extraction_backend(options):
         if not key:
             raise ValueError("Introduce tu clave de Meta en los ajustes.")
 
-        def ask(system, user):
+        def ask(system, user, usage):
             try:
-                return call_meta_extract(system, user, key, model, usage, notify=notify)
+                return call_meta_extract(system, user, key, model, usage, notify=notify, reasoning=reasoning)
             except MetaAccessError as error:
                 raise backends.BackendUnavailable(str(error)) from None
             except MetaRateLimit:
                 raise backends.BackendUnavailable(
                     "Meta sigue limitando las peticiones después de varias esperas. Vuelve a lanzar la "
                     "extracción más tarde: continuará donde lo dejó.") from None
-        backend = backends.Backend("meta", model, ask)
+        backend = backends.Backend("meta", model, lambda system, user: "")
     elif engine == "claude-code":
         if backends.check_backend("claude-code"):
             raise ValueError("No encuentro Claude Code en este Mac. Elige Muse Spark en los ajustes o instala el CLI `claude`.")
         backend = backends.make_backend("claude-code")
-        ask = backend.call
+        inner = backend.call
+        ask = lambda system, user, usage: inner(system, user)
     else:
         raise ValueError("Motor de extracción no válido.")
 
     budget, price_in, price_out = (_number(options, name) for name in ("budget", "price_in", "price_out"))
     spent = {"cost": 0.0, "reached": False}
+    lock = threading.Lock()  # varias llamadas a la vez comparten estos contadores
 
     def call(system, user):
-        if budget and spent["cost"] >= budget:
-            spent["reached"] = True
-            raise backends.BudgetExceeded("presupuesto de la tanda alcanzado")
-        usage.clear()
-        reported = backend.cost_usd or 0.0
-        text = ask(system, user)
+        with lock:
+            if budget and spent["cost"] >= budget:
+                spent["reached"] = True
+                raise backends.BudgetExceeded("presupuesto de la tanda alcanzado")
+            reported = backend.cost_usd or 0.0
+        usage = {}
+        text = ask(system, user, usage)
         tokens_in = int(usage.get("prompt_tokens") or (len(system) + len(user)) / CHARS_PER_TOKEN)
         tokens_out = int(usage.get("completion_tokens") or len(text) / CHARS_PER_TOKEN)
-        backend.input_tokens += tokens_in
-        backend.output_tokens += tokens_out
         details = usage.get("completion_tokens_details")
-        if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
-            backend.reasoning_tokens += details["reasoning_tokens"]
-        if engine == "claude-code" and backend.cost_usd is not None:
-            cost = backend.cost_usd - reported           # lo informa el CLI
-        else:
-            cost = (tokens_in * price_in + tokens_out * price_out) / 1e6
-            backend.cost_usd = reported + cost
-        spent["cost"] += cost
-        emit("spend", cost=round(spent["cost"], 4), tokens_in=backend.input_tokens,
-             tokens_out=backend.output_tokens, budget=budget)
+        with lock:
+            backend.input_tokens += tokens_in
+            backend.output_tokens += tokens_out
+            if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), int):
+                backend.reasoning_tokens += details["reasoning_tokens"]
+            if engine == "claude-code" and backend.cost_usd is not None:
+                cost = max(0.0, backend.cost_usd - reported)   # lo informa el CLI
+            else:
+                cost = (tokens_in * price_in + tokens_out * price_out) / 1e6
+                backend.cost_usd = (backend.cost_usd or 0.0) + cost
+            spent["cost"] += cost
+            emit("spend", cost=round(spent["cost"], 4), tokens_in=backend.input_tokens,
+                 tokens_out=backend.output_tokens, budget=budget)
         return text
 
     backend.call = call
@@ -364,13 +391,18 @@ def run_queue(options):
             backend, spent, current = extraction_backend(options)
             ids = [int(part) for part in str(options.get("ids") or "").split(",") if part.strip().isdigit()]
 
+            try:
+                workers = min(max(int(options.get("workers") or 1), 1), 4)
+            except ValueError:
+                workers = 1
+
             def extractor(target, source_id):
                 title = (target.get_source_by_id(source_id) or {}).get("title") or "Vídeo"
-                def step(message):
-                    current["label"] = f"{title} · {message.strip().rstrip('…')}"
-                    progress(current["label"])
+                current["label"] = title
                 try:
-                    return extract.extract_source(target, source_id, backend, progress=step)
+                    return extract.extract_source(
+                        target, source_id, backend, workers=workers,
+                        progress=lambda message: progress(f"{title} · {message.strip().rstrip('…')}"))
                 finally:
                     current["label"] = ""
 
@@ -580,4 +612,9 @@ if __name__ == "__main__":
         if "Sign in" in message or "bot" in message or "429" in message:
             message = "YouTube ha bloqueado la descarga. Prueba a seleccionar tu navegador en las opciones o pega la transcripción del vídeo."
         emit("error", message=message[:1200])
-        sys.exit(1)
+        sys.stdout.flush()
+        os._exit(1)
+    # Salida inmediata: si quedan llamadas al modelo en otros hilos (pausa o tope de gasto), no se
+    # espera a que terminen; su resultado ya no se va a guardar.
+    sys.stdout.flush()
+    os._exit(0)

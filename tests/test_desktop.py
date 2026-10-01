@@ -166,7 +166,7 @@ class DesktopTests(unittest.TestCase):
         from rezme import Store
         answer = json.dumps({"entities": [], "claims": []})
 
-        def meta(system, user, key, model, usage=None, notify=None):
+        def meta(system, user, key, model, usage=None, notify=None, reasoning=None):
             usage.update(prompt_tokens=100_000, completion_tokens=50_000)
             return answer
 
@@ -197,7 +197,7 @@ class DesktopTests(unittest.TestCase):
         from rezme import Store
         cues = [(i * 30.0, f"frase {i} con algo de contenido") for i in range(80)]  # 40 min: 4-5 tramos
 
-        def meta(system, user, key, model, usage=None, notify=None):
+        def meta(system, user, key, model, usage=None, notify=None, reasoning=None):
             usage.update(prompt_tokens=100_000, completion_tokens=0)
             return json.dumps({"entities": [], "claims": []})
 
@@ -329,6 +329,59 @@ class DesktopTests(unittest.TestCase):
                 worker.call_meta_extract("S", "u", "k", "m", None, notes.append)
         self.assertEqual((len(calls), sleep.call_count), (2, 1))
         self.assertIn("The read operation timed out", notes[-1])
+
+    def test_low_reasoning_is_requested_and_dropped_if_the_model_rejects_it(self):
+        ok = {"choices": [{"finish_reason": "stop", "message": {"content": '{"claims": []}'}}]}
+        urlopen, sent = self.meta_responses(ok, (400, {}, "Unsupported parameter: reasoning_effort"), ok, ok)
+        notes = []
+        worker._pace["seconds"] = 0.0
+        worker._reasoning["supported"] = True
+        try:
+            with patch.object(worker.urllib.request, "urlopen", urlopen), patch("time.sleep"):
+                worker.call_meta_extract("S", "u", "k", "m", None, notes.append, reasoning="low")
+                self.assertEqual(sent[0]["reasoning_effort"], "low")
+                # El modelo lo rechaza: se reintenta sin el ajuste y ya no se vuelve a enviar.
+                worker.call_meta_extract("S", "u", "k", "m", None, notes.append, reasoning="low")
+                self.assertEqual(("reasoning_effort" in sent[1], "reasoning_effort" in sent[2]), (True, False))
+                self.assertEqual(sent[2]["max_completion_tokens"], worker.EXTRACT_MAX_TOKENS)
+                self.assertIn("no admite ajustar el razonamiento", notes[0])
+                worker.call_meta_extract("S", "u", "k", "m", None, notes.append, reasoning="low")
+                self.assertNotIn("reasoning_effort", sent[3])
+        finally:
+            worker._reasoning["supported"] = True
+        # Sin ajuste (el del modelo), no se envía nada.
+        urlopen, sent = self.meta_responses(ok)
+        with patch.object(worker.urllib.request, "urlopen", urlopen):
+            worker.call_meta_extract("S", "u", "k", "m")
+        self.assertNotIn("reasoning_effort", sent[0])
+
+    def test_app_extraction_passes_speed_settings_and_counts_usage_across_threads(self):
+        import tempfile
+        from rezme import Store
+        cues = [(i * 20.0, f"frase número {i} del vídeo de prueba") for i in range(60)]  # 4 tramos
+        seen = []
+
+        def meta(system, user, key, model, usage=None, notify=None, reasoning=None):
+            seen.append(reasoning)
+            usage.update(prompt_tokens=1000, completion_tokens=500,
+                         completion_tokens_details={"reasoning_tokens": 400})
+            return json.dumps({"claims": []})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.extraction_db(tmp)
+            with Store(db) as store:
+                store.save_transcript(1, cues, "whisper")
+            with patch.object(worker, "call_meta_extract", side_effect=meta):
+                events = self.queue(db, action="extract", engine="meta", key="k", model="m", ids="1",
+                                    price_in="1", price_out="2", workers="3", reasoning="low")
+            self.assertEqual(seen, ["low"] * 4)
+            self.assertTrue(any("4 tramos, 3 a la vez" in e.get("message", "") for e in events))
+            spend = [e for e in events if e["type"] == "spend"][-1]
+            self.assertEqual((spend["tokens_in"], spend["tokens_out"], spend["cost"]), (4000, 2000, 0.008))
+            with Store(db) as store:
+                usage = store.get_run(1)["stats"]["consumo"]
+                self.assertEqual((usage["entrada"], usage["salida"], usage["razonamiento"], usage["llamadas"]),
+                                 (4000, 2000, 1600, 4))
 
     def test_exhausted_quota_is_not_retried(self):
         urlopen, sent = self.meta_responses((429, {}, '{"error": {"message": "Insufficient balance"}}'))

@@ -92,7 +92,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
             res = extract_source(
                 store, source_id, make_backend(args.backend, ollama_model=args.ollama_model),
                 domain=None if args.domain == "auto" else args.domain, force=args.force,
-                progress=lambda msg: print(msg, file=sys.stderr))
+                progress=lambda msg: print(msg, file=sys.stderr), workers=args.workers)
         except (ValueError, RuntimeError, ExtractionError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -239,7 +239,7 @@ def cmd_queue_run(args: argparse.Namespace) -> int:
             return 1
         deps.extractor = batch.load_extractor(
             args.backend, domain=None if args.domain == "auto" else args.domain,
-            ollama_model=args.ollama_model)
+            ollama_model=args.ollama_model, workers=args.workers)
         if deps.extractor is None:
             print("La extracción aún no está disponible: se ejecuta solo la ingesta.",
                   file=sys.stderr)
@@ -366,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     x.add_argument("--force", action="store_true",
                    help="Crear un run nuevo aunque ya exista uno igual")
     x.add_argument("--lang", default="es,en", help="Idiomas si hay que ingerir el vídeo")
+    x.add_argument("--workers", type=int, default=1, metavar="N",
+                   help="Tramos que se envían al modelo a la vez")
     x.set_defaults(func=cmd_extract)
 
     c = sub.add_parser("claims", parents=[common],
@@ -415,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
     qr.add_argument("--ollama-model", default="qwen3:14b")
     qr.add_argument("--domain", default="auto",
                     choices=["auto", "macro", "empresa", "ciencia", "cripto"])
+    qr.add_argument("--workers", type=int, default=1, metavar="N",
+                    help="Tramos que se envían al modelo a la vez")
     qr.set_defaults(func=cmd_queue_run)
 
     qs = qsub.add_parser("status", parents=[common], help="Recuento, próximos y últimos errores")

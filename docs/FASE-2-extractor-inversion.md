@@ -242,4 +242,11 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   600 s, un plazo agotado solo se reintenta una vez y, mientras se espera, la
   app muestra cuánto lleva esperando. El coste por vídeo es de milésimas de
   dólar, así que más llamadas no son un problema; la fiabilidad sí.
+- Velocidad: medido en una extracción real, el 82 % de la salida de Muse Spark
+  era razonamiento interno (unos 15.000 tokens por llamada, más de 4 minutos).
+  La extracción envía `reasoning_effort` (bajo por defecto, ajustable) y deja de
+  enviarlo si la API lo rechaza. Además los tramos de un vídeo se envían al
+  modelo en paralelo (2 por defecto, hasta 4); la validación y la escritura en
+  la base siguen siendo secuenciales y en orden. El tope de gasto puede
+  superarse en tantas llamadas como tramos haya en curso.
 

@@ -17,8 +17,10 @@ import json
 import math
 import re
 import secrets
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import prompts
 from .backends import Backend, BackendUnavailable
@@ -491,8 +493,13 @@ def _store_chunk(store: Store, parsed: Parsed, chunk: Chunk, run_id: int, transc
 
 def extract_source(store: Store, source_id: int, backend: Backend, *, domain: str | None = None,
                    force: bool = False, prompt_version: str = prompts.PROMPT_VERSION,
-                   progress: Callable[[str], None] | None = None) -> ExtractResult:
-    """Extrae y verifica las afirmaciones de una fuente ya ingerida."""
+                   progress: Callable[[str], None] | None = None,
+                   workers: int = 1) -> ExtractResult:
+    """Extrae y verifica las afirmaciones de una fuente ya ingerida.
+
+    Con `workers` > 1 las llamadas al modelo de varios tramos se hacen a la vez; la
+    validación y la escritura en la base siguen siendo una a una y en orden.
+    """
     source = store.get_source_by_id(source_id)
     if source is None:
         raise ValueError(f"La fuente {source_id} no existe.")
@@ -523,51 +530,88 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
                                          "caracteres_prompt": 0, "caracteres_transcripcion": 0})
     seen_in, seen_out, seen_reasoning = base_in, base_out, backend.reasoning_tokens
 
-    failures = 0
+    todo: list[Chunk] = []
     for chunk in chunks:
         done = stats["tramos"].get(str(chunk.index))
         if done and done.get("estado") == "ok" and (done.get("inicio"), done.get("fin")) == (
                 chunk.start, chunk.end):
             result.chunks_skipped += 1
-            continue
-        say(f"  Tramo {chunk.index + 1}/{len(chunks)} [{hms(chunk.start)}–{hms(chunk.end)}]…")
-        entry: dict[str, Any] = {"inicio": chunk.start, "fin": chunk.end}
+        else:
+            todo.append(chunk)
+
+    def label(chunk: Chunk) -> str:
+        return f"Tramo {chunk.index + 1}/{len(chunks)} [{hms(chunk.start)}–{hms(chunk.end)}]"
+
+    def work(chunk: Chunk) -> tuple[Parsed, int, int]:
+        user = build_user_prompt(source, chunk, len(chunks), prompt_version)
+        parsed, calls = extract_chunk(backend.call, system, user, source_id, prompt_version)
+        return parsed, calls, len(user)
+
+    def outcomes() -> Iterator[tuple[Chunk, tuple[Parsed, int, int] | None, Exception | None]]:
+        """Resultado de cada tramo, en orden. Un fallo de acceso al modelo se propaga tal cual."""
+        if workers <= 1 or len(todo) <= 1:
+            for chunk in todo:
+                say(f"  {label(chunk)}…")
+                try:
+                    yield chunk, work(chunk), None
+                except BackendUnavailable:
+                    raise
+                except Exception as exc:  # fallo del backend: se anota y se puede reanudar
+                    yield chunk, None, exc
+            return
+        pool = ThreadPoolExecutor(max_workers=min(workers, len(todo)))
         try:
-            user = build_user_prompt(source, chunk, len(chunks), prompt_version)
-            parsed, calls = extract_chunk(backend.call, system, user, source_id, prompt_version)
-        except BackendUnavailable:
-            raise  # sin acceso al modelo no tiene sentido seguir con más tramos
-        except Exception as exc:  # fallo del backend: se anota y se puede reanudar
-            entry.update(estado="error", error=str(exc))
+            say(f"  {len(todo)} tramos, {min(workers, len(todo))} a la vez…")
+            futures = [(chunk, pool.submit(work, chunk)) for chunk in todo]
+            for position, (chunk, future) in enumerate(futures, 1):
+                try:
+                    outcome = future.result()
+                except BackendUnavailable:
+                    raise
+                except Exception as exc:
+                    yield chunk, None, exc
+                else:
+                    say(f"  {label(chunk)} hecho ({position} de {len(todo)})")
+                    yield chunk, outcome, None
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)  # no se lanzan los tramos que faltaban
+
+    failures = 0
+    with closing(outcomes()) as stream:
+        for chunk, outcome, exc in stream:
+            entry: dict[str, Any] = {"inicio": chunk.start, "fin": chunk.end}
+            if outcome is None:
+                entry.update(estado="error", error=str(exc))
+                stats["tramos"][str(chunk.index)] = entry
+                store.update_run(run_id, stats=stats)
+                result.chunks_failed += 1
+                failures += 1
+                if failures >= _MAX_CONSECUTIVE_FAILURES:
+                    raise ExtractionError(
+                        f"El backend {backend.name} ha fallado en {failures} tramos seguidos: {exc}. "
+                        "Vuelve a lanzar la extracción para reanudarla.") from exc
+                continue
+            parsed, calls, user_chars = outcome
+            failures = 0
+            result.llm_calls += calls
+            usage["entrada"] += backend.input_tokens - seen_in
+            usage["salida"] += backend.output_tokens - seen_out
+            usage["razonamiento"] = usage.get("razonamiento", 0) + backend.reasoning_tokens - seen_reasoning
+            seen_in, seen_out = backend.input_tokens, backend.output_tokens
+            seen_reasoning = backend.reasoning_tokens
+            usage["llamadas"] += calls
+            usage["caracteres_prompt"] += len(system) + user_chars
+            usage["caracteres_transcripcion"] += len(render(chunk))
+            if parsed.truncated:
+                entry["truncada"] = True
+            entry.update(estado="ok", reintento=calls > 1, descartes=parsed.errors,
+                         campos_ignorados=parsed.ignored,
+                         **_store_chunk(store, parsed, chunk, run_id, transcript["id"], result))
             stats["tramos"][str(chunk.index)] = entry
-            store.update_run(run_id, stats=stats)
-            result.chunks_failed += 1
-            failures += 1
-            if failures >= _MAX_CONSECUTIVE_FAILURES:
-                raise ExtractionError(
-                    f"El backend {backend.name} ha fallado en {failures} tramos seguidos: {exc}. "
-                    "Vuelve a lanzar la extracción para reanudarla.") from exc
-            continue
-        failures = 0
-        result.llm_calls += calls
-        usage["entrada"] += backend.input_tokens - seen_in
-        usage["salida"] += backend.output_tokens - seen_out
-        usage["razonamiento"] = usage.get("razonamiento", 0) + backend.reasoning_tokens - seen_reasoning
-        seen_in, seen_out = backend.input_tokens, backend.output_tokens
-        seen_reasoning = backend.reasoning_tokens
-        usage["llamadas"] += calls
-        usage["caracteres_prompt"] += len(system) + len(user)
-        usage["caracteres_transcripcion"] += len(render(chunk))
-        if parsed.truncated:
-            entry["truncada"] = True
-        entry.update(estado="ok", reintento=calls > 1, descartes=parsed.errors,
-                     campos_ignorados=parsed.ignored,
-                     **_store_chunk(store, parsed, chunk, run_id, transcript["id"], result))
-        stats["tramos"][str(chunk.index)] = entry
-        spent = (backend.cost_usd or 0.0) - base_cost
-        store.update_run(run_id, stats=stats,
-                         cost_usd=previous_cost + spent if backend.cost_usd is not None else None)
-        result.chunks_processed += 1
+            spent = (backend.cost_usd or 0.0) - base_cost
+            store.update_run(run_id, stats=stats,
+                             cost_usd=previous_cost + spent if backend.cost_usd is not None else None)
+            result.chunks_processed += 1
 
     complete = all(stats["tramos"].get(str(c.index), {}).get("estado") == "ok" for c in chunks)
     if complete and result.chunks_processed:

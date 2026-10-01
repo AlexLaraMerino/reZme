@@ -139,6 +139,10 @@ final class AppModel: ObservableObject {
     /// Modelo que extrae las afirmaciones: "meta" (Muse Spark) o "claude-code".
     @Published var engine: String { didSet { defaults.set(engine, forKey: "engine") } }
     @Published var confirmExtract = false
+    /// Velocidad de la extracción: cuánto razona el modelo ("low", "medium" o "" = el suyo) y
+    /// cuántos tramos se le envían a la vez.
+    @Published var reasoning: String { didSet { defaults.set(reasoning, forKey: "reasoning") } }
+    @Published var workers: Int { didSet { defaults.set(workers, forKey: "workers") } }
     /// Presupuesto de extracción: tope por tanda y precios por millón de tokens, en dólares.
     @Published var budget: String { didSet { defaults.set(budget, forKey: "budget") } }
     @Published var priceIn: String { didSet { defaults.set(priceIn, forKey: "priceIn") } }
@@ -159,6 +163,8 @@ final class AppModel: ObservableObject {
         whisper = defaults.bool(forKey: "whisper")
         engine = defaults.string(forKey: "engine") ?? "meta"
         budget = defaults.string(forKey: "budget") ?? "5"
+        reasoning = defaults.string(forKey: "reasoning") ?? "low"
+        workers = defaults.object(forKey: "workers") as? Int ?? 2
         priceIn = defaults.string(forKey: "priceIn") ?? ""
         priceOut = defaults.string(forKey: "priceOut") ?? ""
     }
@@ -366,7 +372,8 @@ final class AppModel: ObservableObject {
         spent = 0
         let started = launch(["mode": "queue", "action": "extract", "engine": engine, "db": database.path,
                               "key": engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : "", "model": model,
-                              "ids": ids, "budget": String(budgetValue), "price_in": String(number(priceIn)), "price_out": String(number(priceOut))],
+                              "ids": ids, "budget": String(budgetValue), "price_in": String(number(priceIn)), "price_out": String(number(priceOut)),
+                              "reasoning": reasoning, "workers": String(workers)],
                              owner: .library,
                              onEvent: { event in
                                  self.queueEvent(event)
@@ -1034,7 +1041,25 @@ struct ContentView: View {
                         Text("Claude Code").tag("claude-code")
                     }.labelsHidden().fixedSize().disabled(app.busy == .library)
                 }
-                setting("Presupuesto de extracción", "En dólares. La extracción se detiene sola al llegar al tope de cada tanda; como mucho lo supera en una llamada. Los precios son los de tu modelo por millón de tokens (consulta la tarifa de tu proveedor); con Claude Code se usa el coste que informa el propio CLI.") {
+                setting("Velocidad de extracción", "El modelo gasta casi todo el tiempo en razonar antes de escribir: con razonamiento bajo responde mucho antes, a cambio de pensar menos cada afirmación. Si tu modelo no admite el ajuste, se usa el suyo sin más. Enviar varios tramos a la vez divide el tiempo; si Meta limita las peticiones, la app espera y sigue, pero baja el número si lo ves a menudo.") {
+                    HStack(spacing: 18) {
+                        HStack(spacing: 6) {
+                            Text("Razonamiento").font(.caption)
+                            Picker("", selection: $app.reasoning) {
+                                Text("Bajo (más rápido)").tag("low")
+                                Text("Medio").tag("medium")
+                                Text("El del modelo").tag("")
+                            }.labelsHidden().fixedSize()
+                        }
+                        HStack(spacing: 6) {
+                            Text("Tramos a la vez").font(.caption)
+                            Picker("", selection: $app.workers) {
+                                ForEach(1...4, id: \.self) { Text("\($0)").tag($0) }
+                            }.labelsHidden().fixedSize()
+                        }
+                    }.disabled(app.busy == .library)
+                }
+                setting("Presupuesto de extracción", "En dólares. La extracción se detiene sola al llegar al tope de cada tanda; como mucho lo supera en las llamadas que estén en curso en ese momento. Los precios son los de tu modelo por millón de tokens (consulta la tarifa de tu proveedor); con Claude Code se usa el coste que informa el propio CLI.") {
                     HStack(spacing: 14) {
                         HStack(spacing: 5) { Text("Tope por tanda").font(.caption); TextField("5", text: $app.budget).textFieldStyle(.roundedBorder).frame(width: 64); Text("$").font(.caption) }
                         HStack(spacing: 5) { Text("Entrada").font(.caption); TextField("—", text: $app.priceIn).textFieldStyle(.roundedBorder).frame(width: 64); Text("$/M").font(.caption) }
