@@ -68,7 +68,7 @@ Conserva la carpeta del proyecto: la app depende de `.venv` y del Python instala
 1. En **Cola**, pega la URL de una lista de reproducción o varias URLs, una por línea.
 2. Pulsa **Añadir y procesar**. Cada vídeo aparece con su estado; puedes pausar y continuar después.
 3. Los vídeos sin subtítulos quedan marcados. Para transcribirlos, activa Whisper y vuelve a procesar.
-4. En **Base de conocimiento** verás lo guardado. Pulsa **Extraer afirmaciones** para que el modelo elegido en Ajustes lea cada transcripción; solo se conservan como verificadas las afirmaciones cuya cita y cifras aparecen en el texto. La app indica antes cuántas llamadas al modelo hará. Se puede pausar y continuar.
+4. En **Base de conocimiento** verás lo guardado. Pulsa **Extraer afirmaciones** para que el modelo elegido en Ajustes lea cada transcripción; solo se conservan como verificadas las afirmaciones cuya cita y cifras aparecen en el texto. Cada vídeo muestra su coste estimado y una casilla para incluirlo o no. **Probar con un vídeo** extrae solo el más barato y sirve para medir el consumo real, con el que se ajustan las estimaciones del resto. La extracción se detiene sola al llegar al tope de gasto por tanda que fijes en Ajustes, junto al precio por millón de tokens de tu modelo. Se puede pausar y continuar.
 
 **Informe de un solo vídeo**
 

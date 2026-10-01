@@ -51,6 +51,34 @@ struct LibrarySource: Identifiable {
     let detail: String
     let verified: Int
     let url: String
+    /// Trabajo de extracción pendiente y su consumo estimado (nil si ya tiene afirmaciones).
+    var job: Int? = nil
+    var calls = 0
+    var tokensIn = 0
+    var tokensOut = 0
+}
+
+struct ClaimItem: Identifiable {
+    let id: Int
+    let verified: Bool
+    let statement: String
+    let kind: String
+    let entity: String
+    let metric: String
+    let time: String
+    let link: String
+    let quote: String
+    let reasons: [String]
+    let implications: [String]
+}
+
+struct SourceDetail {
+    let id: Int
+    let title: String
+    let url: String
+    let claims: [ClaimItem]
+    var verified: [ClaimItem] { claims.filter { $0.verified } }
+    var unverified: [ClaimItem] { claims.filter { !$0.verified } }
 }
 
 struct ClaimHit: Identifiable {
@@ -80,6 +108,8 @@ final class AppModel: ObservableObject {
     @Published var stats: [String: Int] = [:]
     @Published var query = ""
     @Published var hits: [ClaimHit]? = nil
+    /// Vídeo abierto en detalle, con sus afirmaciones.
+    @Published var detail: SourceDetail? = nil
 
     // Informe rápido
     @Published var url = ""
@@ -96,6 +126,14 @@ final class AppModel: ObservableObject {
     /// Modelo que extrae las afirmaciones: "meta" (Muse Spark) o "claude-code".
     @Published var engine: String { didSet { defaults.set(engine, forKey: "engine") } }
     @Published var confirmExtract = false
+    /// Presupuesto de extracción: tope por tanda y precios por millón de tokens, en dólares.
+    @Published var budget: String { didSet { defaults.set(budget, forKey: "budget") } }
+    @Published var priceIn: String { didSet { defaults.set(priceIn, forKey: "priceIn") } }
+    @Published var priceOut: String { didSet { defaults.set(priceOut, forKey: "priceOut") } }
+    /// Trabajos que el usuario ha dejado fuera de la extracción.
+    @Published var excluded: Set<Int> = []
+    @Published var spent: Double = 0
+    @Published var pilot = false
 
     private var process: Process?
     private var generation = UUID()
@@ -107,6 +145,9 @@ final class AppModel: ObservableObject {
         browser = defaults.string(forKey: "browser") ?? ""
         whisper = defaults.bool(forKey: "whisper")
         engine = defaults.string(forKey: "engine") ?? "meta"
+        budget = defaults.string(forKey: "budget") ?? "5"
+        priceIn = defaults.string(forKey: "priceIn") ?? ""
+        priceOut = defaults.string(forKey: "priceOut") ?? ""
     }
 
     var root: URL { Bundle.main.bundleURL.resolvingSymlinksInPath().deletingLastPathComponent() }
@@ -114,6 +155,40 @@ final class AppModel: ObservableObject {
     var waiting: Int { (counts["pending"] ?? 0) + (counts["running"] ?? 0) }
     var saved: Int { (counts["saved"] ?? 0) + (counts["done"] ?? 0) }
     var toExtract: Int { stats["to_extract"] ?? 0 }
+    var calibrated: Bool { (stats["calibrated"] ?? 0) > 0 }
+
+    private func number(_ text: String) -> Double {
+        max(0, Double(text.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")) ?? 0)
+    }
+    var budgetValue: Double { number(budget) }
+    var hasPrices: Bool { number(priceIn) > 0 && number(priceOut) > 0 }
+    func cost(_ source: LibrarySource) -> Double {
+        (Double(source.tokensIn) * number(priceIn) + Double(source.tokensOut) * number(priceOut)) / 1_000_000
+    }
+    func money(_ value: Double) -> String {
+        value > 0 && value < 0.01 ? "< 0,01 $" : String(format: "%.2f $", value).replacingOccurrences(of: ".", with: ",")
+    }
+    func tokens(_ value: Int) -> String {
+        value >= 1_000_000 ? String(format: "%.2f M", Double(value) / 1_000_000).replacingOccurrences(of: ".", with: ",")
+                           : "\(Int((Double(value) / 1000).rounded())) mil"
+    }
+    var pending: [LibrarySource] { sources.filter { $0.job != nil } }
+    var selected: [LibrarySource] { pending.filter { !excluded.contains($0.job ?? -1) } }
+    /// Lo que se va a extraer: la selección, o en una prueba solo el vídeo más barato de ella.
+    var batchToRun: [LibrarySource] {
+        pilot ? Array(selected.sorted { $0.calls == $1.calls ? $0.tokensIn < $1.tokensIn : $0.calls < $1.calls }.prefix(1)) : selected
+    }
+    func summary(_ items: [LibrarySource]) -> String {
+        let calls = items.reduce(0) { $0 + $1.calls }
+        let tin = items.reduce(0) { $0 + $1.tokensIn }, tout = items.reduce(0) { $0 + $1.tokensOut }
+        var text = "\(calls) llamadas · ≈ \(tokens(tin)) tokens de entrada y \(tokens(tout)) de salida"
+        if hasPrices { text += " · ≈ \(money(items.reduce(0) { $0 + cost($1) }))" }
+        return text
+    }
+    func toggle(_ source: LibrarySource) {
+        guard let job = source.job else { return }
+        if excluded.contains(job) { excluded.remove(job) } else { excluded.insert(job) }
+    }
     var engineName: String { engine == "meta" ? "Muse Spark" : "Claude Code" }
 
     private func fail(_ message: String) { error = true; status = message }
@@ -231,15 +306,21 @@ final class AppModel: ObservableObject {
 
     // MARK: Extracción de afirmaciones
 
-    /// Pide confirmación antes de gastar llamadas al modelo.
-    func askExtract() {
+    /// Pide confirmación antes de gastar llamadas al modelo. Con `pilot`, solo el vídeo más barato.
+    func askExtract(pilot: Bool) {
         guard busy == nil else { status = "Hay una tarea en curso. Espera a que termine o páusala."; error = true; return }
         if engine == "meta" {
             loadKey()
             if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 pane = .settings; fail("Introduce tu clave de Meta en los ajustes, o elige Claude Code como motor."); return
             }
+            if !hasPrices {
+                pane = .settings; fail("Introduce en los ajustes el precio por millón de tokens de tu modelo: sin él no se puede aplicar el tope de gasto."); return
+            }
         }
+        if budgetValue <= 0 { pane = .settings; fail("Fija en los ajustes un tope de gasto por tanda."); return }
+        self.pilot = pilot
+        guard !batchToRun.isEmpty else { fail("No hay ningún vídeo seleccionado."); return }
         confirmExtract = true
     }
 
@@ -247,12 +328,20 @@ final class AppModel: ObservableObject {
         guard busy == nil else { return }
         error = false
         if engine == "meta" { saveKey() }
+        let ids = batchToRun.compactMap { $0.job }.map(String.init).joined(separator: ",")
+        guard !ids.isEmpty else { return }
+        spent = 0
         let started = launch(["mode": "queue", "action": "extract", "engine": engine, "db": database.path,
-                              "key": engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : "", "model": model],
+                              "key": engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : "", "model": model,
+                              "ids": ids, "budget": String(budgetValue), "price_in": String(number(priceIn)), "price_out": String(number(priceOut))],
                              owner: .library,
                              onEvent: { event in
                                  self.queueEvent(event)
-                                 if event["type"] as? String == "queue" { self.loadLibrary() }
+                                 switch event["type"] as? String {
+                                 case "queue": self.loadLibrary()
+                                 case "spend": self.spent = event["cost"] as? Double ?? self.spent
+                                 default: break
+                                 }
                              },
                              onExit: { ok in
                                  if !ok && !self.error { self.fail("La extracción se ha interrumpido. Vuelve a lanzarla: continuará donde lo dejó.") }
@@ -263,11 +352,32 @@ final class AppModel: ObservableObject {
 
     // MARK: Base de conocimiento
 
+    func open(_ source: LibrarySource) {
+        detail = SourceDetail(id: source.id, title: source.title, url: source.url, claims: [])
+        loadLibrary()
+    }
+    func openLink(_ link: String) {
+        if let url = URL(string: link), !link.isEmpty { NSWorkspace.shared.open(url) }
+    }
+
     func loadLibrary(search: Bool = false) {
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty { hits = nil }
-        launch(["mode": "library", "db": database.path, "query": search ? text : ""], owner: nil, onEvent: { event in
+        launch(["mode": "library", "db": database.path, "query": search ? text : "",
+                "source": detail.map { String($0.id) } ?? ""], owner: nil, onEvent: { event in
             switch event["type"] as? String {
+            case "detail":
+                guard let id = event["id"] as? Int, id == self.detail?.id else { break }
+                let claims: [ClaimItem] = (event["claims"] as? [[String: Any]] ?? []).compactMap { item in
+                    guard let claimID = item["id"] as? Int else { return nil }
+                    return ClaimItem(id: claimID, verified: item["verified"] as? Bool ?? false,
+                                     statement: item["statement"] as? String ?? "", kind: item["kind"] as? String ?? "",
+                                     entity: item["entity"] as? String ?? "", metric: item["metric"] as? String ?? "",
+                                     time: item["time"] as? String ?? "", link: item["link"] as? String ?? "",
+                                     quote: item["quote"] as? String ?? "", reasons: item["reasons"] as? [String] ?? [],
+                                     implications: item["implications"] as? [String] ?? [])
+                }
+                self.detail = SourceDetail(id: id, title: event["title"] as? String ?? "", url: event["url"] as? String ?? "", claims: claims)
             case "library":
                 self.stats = event["stats"] as? [String: Int] ?? [:]
                 self.sources = (event["sources"] as? [[String: Any]] ?? []).compactMap { item in
@@ -275,7 +385,9 @@ final class AppModel: ObservableObject {
                     let parts = [item["channel"] as? String ?? "", item["date"] as? String ?? ""].filter { !$0.isEmpty }
                     return LibrarySource(id: id, title: item["title"] as? String ?? "", subtitle: parts.joined(separator: " · "),
                                          detail: item["detail"] as? String ?? "", verified: item["verified"] as? Int ?? 0,
-                                         url: item["url"] as? String ?? "")
+                                         url: item["url"] as? String ?? "", job: item["job"] as? Int,
+                                         calls: item["calls"] as? Int ?? 0, tokensIn: item["tokens_in"] as? Int ?? 0,
+                                         tokensOut: item["tokens_out"] as? Int ?? 0)
                 }
             case "hits":
                 self.hits = (event["items"] as? [[String: Any]] ?? []).compactMap { item in
@@ -422,7 +534,7 @@ struct ContentView: View {
         let selected = app.pane == pane
         return Button {
             app.pane = pane
-            if pane == .library { app.loadLibrary(search: !app.query.isEmpty) }
+            if pane == .library { if app.pane == .library { app.detail = nil }; app.loadLibrary(search: !app.query.isEmpty) }
             if pane == .queue && app.busy == nil { app.queue("status") }
             if pane == .settings { app.loadKey() }
         } label: {
@@ -567,7 +679,78 @@ struct ContentView: View {
 
     // MARK: Base de conocimiento
 
-    var libraryPane: some View {
+    func claimRow(_ claim: ClaimItem) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(claim.statement).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Text(claim.kind).font(.caption.weight(.medium)).foregroundStyle(accent)
+                    .padding(.horizontal, 7).padding(.vertical, 2).background(accent.opacity(0.10), in: Capsule())
+                if !claim.metric.isEmpty {
+                    Text(claim.metric).font(.caption.weight(.medium)).padding(.horizontal, 7).padding(.vertical, 2).background(panel, in: Capsule())
+                }
+                if !claim.entity.isEmpty { Text(claim.entity).font(.caption).foregroundStyle(.secondary) }
+                if !claim.time.isEmpty {
+                    Button { app.openLink(claim.link) } label: { Label(claim.time, systemImage: "play.circle") }
+                        .buttonStyle(.plain).font(.caption).foregroundStyle(accent).help("Abrir el vídeo en ese momento")
+                }
+            }
+            if !claim.quote.isEmpty {
+                Text("«\(claim.quote)»").font(.caption).italic().foregroundStyle(.secondary).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(claim.implications, id: \.self) { implication in
+                Label(implication, systemImage: "arrow.turn.down.right").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(claim.reasons, id: \.self) { reason in
+                Label("No verificada: \(reason)", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Color.orange)
+            }
+        }
+    }
+
+    func detailPane(_ detail: SourceDetail) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { app.detail = nil } label: { Label("Base de conocimiento", systemImage: "chevron.left") }
+                .buttonStyle(.plain).foregroundStyle(accent).padding(.bottom, 10)
+            HStack(alignment: .top) {
+                Text(detail.title).font(.system(size: 22, weight: .semibold, design: .serif)).lineLimit(2)
+                Spacer()
+                if !detail.url.isEmpty { Button { app.openLink(detail.url) } label: { Label("Ver en YouTube", systemImage: "play.rectangle") } }
+            }.padding(.bottom, 4)
+            Text(detail.claims.isEmpty ? "Aún no se han extraído afirmaciones de este vídeo."
+                 : "\(detail.verified.count) afirmaciones verificadas · \(detail.unverified.count) sin verificar")
+                .font(.callout).foregroundStyle(.secondary).padding(.bottom, 14)
+            if detail.claims.isEmpty {
+                emptyState("text.badge.checkmark", "Sin afirmaciones todavía", "Vuelve a la base, selecciona este vídeo\ny pulsa «Extraer selección».")
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if !detail.verified.isEmpty {
+                            Text("VERIFICADAS · el autor lo dice y la cita y la cifra están en la transcripción")
+                                .font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.bottom, 4)
+                            ForEach(detail.verified) { claim in
+                                claimRow(claim).padding(.vertical, 10).frame(maxWidth: .infinity, alignment: .leading)
+                                Divider().opacity(0.6)
+                            }
+                        }
+                        if !detail.unverified.isEmpty {
+                            Text("SIN VERIFICAR · el modelo las propuso, pero la cita o la cifra no se encontraron tal cual")
+                                .font(.caption.weight(.semibold)).foregroundStyle(Color.orange).padding(.top, 18).padding(.bottom, 4)
+                            ForEach(detail.unverified) { claim in
+                                claimRow(claim).padding(.vertical, 10).frame(maxWidth: .infinity, alignment: .leading)
+                                Divider().opacity(0.6)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder var libraryPane: some View {
+        if let detail = app.detail { detailPane(detail) } else { libraryList }
+    }
+
+    var libraryList: some View {
         VStack(alignment: .leading, spacing: 0) {
             header("Base de conocimiento", "Lo que reZme ha guardado y verificado, listo para consultar.")
             HStack(spacing: 10) {
@@ -579,22 +762,27 @@ struct ContentView: View {
             if app.busy == .library || app.toExtract > 0 {
                 HStack(spacing: 12) {
                     Image(systemName: "sparkles").font(.title3).foregroundStyle(accent)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(app.busy == .library ? "Extrayendo afirmaciones con \(app.engineName)…"
-                             : app.toExtract == 1 ? "1 vídeo tiene transcripción pero aún no afirmaciones"
-                             : "\(app.toExtract) vídeos tienen transcripción pero aún no afirmaciones")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text(app.busy == .library ? "Quedan \(app.toExtract). Puedes pausar y continuar después."
-                             : "El modelo lee cada transcripción, extrae las afirmaciones y solo conserva las que puede comprobar en el texto.")
-                            .font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        if app.busy == .library {
+                            Text("Extrayendo afirmaciones con \(app.engineName)…").font(.system(size: 13, weight: .semibold))
+                            Text("Gastado \(app.money(app.spent)) de un tope de \(app.money(app.budgetValue)). Puedes pausar y continuar después.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("\(app.selected.count) de \(app.toExtract) vídeos sin afirmaciones seleccionados").font(.system(size: 13, weight: .semibold))
+                            Text(app.summary(app.selected)).font(.caption).foregroundStyle(.secondary)
+                            Text(app.calibrated ? "Estimación ajustada con el consumo real de las extracciones ya hechas. Tope por tanda: \(app.money(app.budgetValue))."
+                                 : "Estimación sin calibrar: la salida del modelo aún no se ha medido. Prueba primero con un vídeo.")
+                                .font(.caption).foregroundStyle(app.calibrated ? Color.secondary : Color.orange)
+                        }
                     }
                     Spacer()
                     if app.busy == .library {
                         ProgressView().controlSize(.small)
                         Button("Pausar", action: app.cancel)
                     } else {
-                        Button(action: app.askExtract) { Label("Extraer afirmaciones", systemImage: "arrow.right").padding(.horizontal, 4) }
-                            .buttonStyle(.borderedProminent).tint(accent).disabled(app.busy != nil)
+                        Button("Probar con un vídeo") { app.askExtract(pilot: true) }.disabled(app.busy != nil || app.selected.isEmpty)
+                        Button { app.askExtract(pilot: false) } label: { Label("Extraer selección", systemImage: "arrow.right").padding(.horizontal, 4) }
+                            .buttonStyle(.borderedProminent).tint(accent).disabled(app.busy != nil || app.selected.isEmpty)
                     }
                 }
                 .padding(13).background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
@@ -628,16 +816,36 @@ struct ContentView: View {
             } else if app.sources.isEmpty {
                 emptyState("cylinder.split.1x2", "Aún no hay nada guardado", "Añade vídeos desde la cola y aparecerán aquí\ncon su transcripción.")
             } else {
-                Text("VÍDEOS GUARDADOS").font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.bottom, 6)
+                HStack {
+                    Text("VÍDEOS GUARDADOS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    if !app.pending.isEmpty {
+                        Button("Todos") { app.excluded = [] }
+                        Button("Ninguno") { app.excluded = Set(app.pending.compactMap { $0.job }) }
+                    }
+                }.controlSize(.small).disabled(app.busy == .library).padding(.bottom, 6)
                 rows(app.sources) { source in
                     HStack(alignment: .top, spacing: 10) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(source.title).lineLimit(1)
-                            Text([source.subtitle, source.detail].filter { !$0.isEmpty }.joined(separator: " · "))
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        if let job = source.job {
+                            Button { app.toggle(source) } label: {
+                                Image(systemName: app.excluded.contains(job) ? "square" : "checkmark.square.fill")
+                                    .foregroundStyle(app.excluded.contains(job) ? Color.secondary : accent)
+                            }.buttonStyle(.plain).disabled(app.busy == .library).padding(.top, 1)
+                        } else if !app.pending.isEmpty {
+                            Image(systemName: "checkmark.seal.fill").foregroundStyle(accent).padding(.top, 1)
                         }
-                        Spacer()
-                        Text(source.verified > 0 ? "\(source.verified) afirmaciones" : "Solo transcripción")
+                        Button { app.open(source) } label: {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(source.title).lineLimit(1)
+                                    Text([source.subtitle, source.detail].filter { !$0.isEmpty }.joined(separator: " · "))
+                                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                Spacer()
+                            }.contentShape(Rectangle())
+                        }.buttonStyle(.plain).help("Ver las afirmaciones de este vídeo")
+                        Text(source.job != nil ? (app.hasPrices ? "≈ \(app.money(app.cost(source))) · " : "") + "\(source.calls) llamadas"
+                             : source.verified > 0 ? "\(source.verified) afirmaciones" : "Sin afirmaciones")
                             .font(.caption).foregroundStyle(source.verified > 0 ? accent : Color.secondary)
                             .padding(.horizontal, 8).padding(.vertical, 3)
                             .background((source.verified > 0 ? accent : Color.gray).opacity(0.12), in: Capsule())
@@ -651,11 +859,14 @@ struct ContentView: View {
                 Button("Mostrar en Finder", action: app.revealDatabase).controlSize(.small)
             }.padding(.top, 10)
         }
-        .confirmationDialog("¿Extraer las afirmaciones de \(app.toExtract) vídeos?", isPresented: $app.confirmExtract) {
+        .confirmationDialog(app.pilot ? "¿Probar la extracción con un vídeo?" : "¿Extraer las afirmaciones de \(app.batchToRun.count) vídeos?",
+                            isPresented: $app.confirmExtract) {
             Button("Extraer con \(app.engineName)") { app.extract() }
             Button("Cancelar", role: .cancel) {}
         } message: {
-            Text("Serán unas \(app.stats["calls"] ?? 0) llamadas al modelo, una por cada tramo de 3–4 minutos, y puede tardar horas. "
+            Text((app.pilot ? "«\(app.batchToRun.first?.title ?? "")»: " : "") + app.summary(app.batchToRun) + ". "
+                 + (app.calibrated ? "" : "Es una estimación sin calibrar. ")
+                 + "La extracción se detendrá sola al llegar a \(app.money(app.budgetValue)). "
                  + (app.engine == "meta" ? "El consumo se factura en tu cuenta de Meta." : "Se usa tu suscripción de Claude Code.")
                  + " Puedes pausar cuando quieras: continuará donde lo dejó.")
         }
@@ -736,6 +947,13 @@ struct ContentView: View {
                         Text("Muse Spark (clave de Meta)").tag("meta")
                         Text("Claude Code").tag("claude-code")
                     }.labelsHidden().fixedSize().disabled(app.busy == .library)
+                }
+                setting("Presupuesto de extracción", "En dólares. La extracción se detiene sola al llegar al tope de cada tanda; como mucho lo supera en una llamada. Los precios son los de tu modelo por millón de tokens (consulta la tarifa de tu proveedor); con Claude Code se usa el coste que informa el propio CLI.") {
+                    HStack(spacing: 14) {
+                        HStack(spacing: 5) { Text("Tope por tanda").font(.caption); TextField("5", text: $app.budget).textFieldStyle(.roundedBorder).frame(width: 64); Text("$").font(.caption) }
+                        HStack(spacing: 5) { Text("Entrada").font(.caption); TextField("—", text: $app.priceIn).textFieldStyle(.roundedBorder).frame(width: 64); Text("$/M").font(.caption) }
+                        HStack(spacing: 5) { Text("Salida").font(.caption); TextField("—", text: $app.priceOut).textFieldStyle(.roundedBorder).frame(width: 64); Text("$/M").font(.caption) }
+                    }.disabled(app.busy == .library)
                 }
                 setting("Modelo", "Identificador del modelo de Meta, para el informe y para la extracción con Muse Spark.") {
                     TextField("muse-spark-1.3", text: $app.model).textFieldStyle(.roundedBorder).frame(width: 260)

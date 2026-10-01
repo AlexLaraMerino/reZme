@@ -196,4 +196,9 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   intentos, se transcribe con Whisper cuando está permitido.
 - El backend `claude-code` llama al CLI sin `--bare` (que ignora la sesión
   iniciada), sin herramientas y con salida JSON para registrar el coste.
+- Coste: los tramos pasan a ~10 minutos (los capítulos cortos se agrupan),
+  porque cada llamada repite las instrucciones enteras; el prompt limita a 25
+  afirmaciones por tramo. Cada run guarda su consumo (`stats.consumo` y
+  `cost_usd`). La app estima el coste por vídeo, calibra la estimación con el
+  consumo real de los runs anteriores y aplica un tope de gasto por tanda.
 

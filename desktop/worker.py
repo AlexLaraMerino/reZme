@@ -32,7 +32,8 @@ class MetaAccessError(RuntimeError):
     """Meta rechaza la petición por clave, permisos, modelo o saldo: reintentar no lo arregla."""
 
 
-def call_meta(prompt, key, model, system=None):
+def call_meta(prompt, key, model, system=None, usage=None):
+    """Una llamada a Meta. Si se pasa `usage` (dict), se rellena con los tokens que informe la API."""
     request = urllib.request.Request(
         "https://api.meta.ai/v1/chat/completions",
         data=json.dumps({"model": model, "messages": [
@@ -51,6 +52,8 @@ def call_meta(prompt, key, model, system=None):
         if error.code in messages:
             raise MetaAccessError(messages[error.code]) from None
         raise RuntimeError(f"Meta devolvió un error ({error.code}). Inténtalo más tarde.") from None
+    if usage is not None and isinstance(data.get("usage"), dict):
+        usage.update(data["usage"])
     choice = data["choices"][0]
     if choice.get("finish_reason") == "length":
         raise RuntimeError("Meta alcanzó el límite de respuesta. No se ha guardado un informe incompleto; prueba el modo prompt.")
@@ -129,28 +132,71 @@ def emit_queue(store):
          counts={state: count(state) for state in ("saved", "done", "pending", "running", "failed", "skipped")})
 
 
+CHARS_PER_TOKEN = 3.5
+
+
+def _number(options, name):
+    try:
+        return max(0.0, float(str(options.get(name) or "0").replace(",", ".")))
+    except ValueError:
+        return 0.0
+
+
 def extraction_backend(options):
-    """Modelo que extrae las afirmaciones: Muse Spark (clave de Meta) o el CLI de Claude Code."""
+    """Modelo que extrae las afirmaciones, con contador de consumo y tope de gasto por tanda.
+
+    Muse Spark (clave de Meta): el gasto se calcula con los tokens que informa la API y los
+    precios de los ajustes. Claude Code: se usa el coste que informa el propio CLI.
+    """
     from rezme import backends
 
     engine = options.get("engine") or "meta"
+    usage = {}
     if engine == "meta":
         key, model = options.get("key", "").strip(), options.get("model") or "muse-spark-1.3"
         if not key:
             raise ValueError("Introduce tu clave de Meta en los ajustes.")
 
-        def call(system, user):
+        def ask(system, user):
             try:
-                return call_meta(user, key, model, system)
+                return call_meta(user, key, model, system, usage)
             except MetaAccessError as error:
                 raise backends.BackendUnavailable(str(error)) from None
-        return backends.Backend("meta", model, call)
-    if engine == "claude-code":
-        problem = backends.check_backend("claude-code")
-        if problem:
+        backend = backends.Backend("meta", model, ask)
+    elif engine == "claude-code":
+        if backends.check_backend("claude-code"):
             raise ValueError("No encuentro Claude Code en este Mac. Elige Muse Spark en los ajustes o instala el CLI `claude`.")
-        return backends.make_backend("claude-code")
-    raise ValueError("Motor de extracción no válido.")
+        backend = backends.make_backend("claude-code")
+        ask = backend.call
+    else:
+        raise ValueError("Motor de extracción no válido.")
+
+    budget, price_in, price_out = (_number(options, name) for name in ("budget", "price_in", "price_out"))
+    spent = {"cost": 0.0, "reached": False}
+
+    def call(system, user):
+        if budget and spent["cost"] >= budget:
+            spent["reached"] = True
+            raise backends.BudgetExceeded("presupuesto de la tanda alcanzado")
+        usage.clear()
+        reported = backend.cost_usd or 0.0
+        text = ask(system, user)
+        tokens_in = int(usage.get("prompt_tokens") or (len(system) + len(user)) / CHARS_PER_TOKEN)
+        tokens_out = int(usage.get("completion_tokens") or len(text) / CHARS_PER_TOKEN)
+        backend.input_tokens += tokens_in
+        backend.output_tokens += tokens_out
+        if engine == "claude-code" and backend.cost_usd is not None:
+            cost = backend.cost_usd - reported           # lo informa el CLI
+        else:
+            cost = (tokens_in * price_in + tokens_out * price_out) / 1e6
+            backend.cost_usd = reported + cost
+        spent["cost"] += cost
+        emit("spend", cost=round(spent["cost"], 4), tokens_in=backend.input_tokens,
+             tokens_out=backend.output_tokens, budget=budget)
+        return text
+
+    backend.call = call
+    return backend, spent
 
 
 def run_queue(options):
@@ -173,7 +219,8 @@ def run_queue(options):
             store.clear_done_jobs()
         elif action == "extract":
             from rezme import extract
-            backend = extraction_backend(options)
+            backend, spent = extraction_backend(options)
+            ids = [int(part) for part in str(options.get("ids") or "").split(",") if part.strip().isdigit()]
 
             def extractor(target, source_id):
                 title = (target.get_source_by_id(source_id) or {}).get("title") or "Vídeo"
@@ -186,11 +233,15 @@ def run_queue(options):
             store.recover_running_jobs()
             emit_queue(store)
             summary = batch.run_queue(store, stage="extract", delay=0, deps=deps, out=progress,
-                                      on_change=lambda: emit_queue(store))
+                                      on_change=lambda: emit_queue(store), only=ids or None)
             emit_queue(store)
+            money = f"{spent['cost']:.2f} $"
+            if spent["reached"]:
+                emit("done", message=f"Tope de gasto alcanzado ({money}). Lo extraído se conserva y el resto sigue en cola.")
+                return
             if summary.stopped:
                 raise RuntimeError(f"Extracción detenida: {summary.stopped}")
-            emit("done", message=batch.format_summary(summary))
+            emit("done", message=batch.format_summary(summary) + f" · gasto de la tanda {money}")
             return
         elif action == "run":
             urls = batch.read_urls(options.get("urls", "").splitlines())
@@ -217,40 +268,109 @@ def run_queue(options):
         emit_queue(store)
 
 
+def _calibration(store):
+    """Caracteres por token de entrada y tokens de salida por carácter de transcripción, medidos
+    en las extracciones ya hechas. Sin datos: 3,5 caracteres por token y salida ≈ transcripción."""
+    chars_prompt = tokens_in = chars_text = tokens_out = runs = 0
+    for row in store.db.execute("SELECT stats_json FROM extraction_runs"):
+        usage = json.loads(row["stats_json"] or "{}").get("consumo") or {}
+        if usage.get("entrada") and usage.get("salida") and usage.get("caracteres_transcripcion"):
+            chars_prompt += usage["caracteres_prompt"]
+            tokens_in += usage["entrada"]
+            chars_text += usage["caracteres_transcripcion"]
+            tokens_out += usage["salida"]
+            runs += 1
+    if not runs:
+        return CHARS_PER_TOKEN, 1 / CHARS_PER_TOKEN, 0
+    # Los reintentos cuentan como entrada pero no como caracteres: la estimación queda algo alta.
+    return min(chars_prompt / tokens_in, CHARS_PER_TOKEN * 1.5), tokens_out / chars_text, runs
+
+
+TYPE_LABELS = {
+    "fact": "Hecho", "statistic": "Dato", "study_result": "Estudio", "causal_claim": "Causa y efecto",
+    "forecast": "Previsión", "opinion": "Opinión", "own_calculation": "Cálculo del autor",
+    "recommendation": "Recomendación", "risk": "Riesgo", "catalyst": "Catalizador",
+    "methodology": "Método", "definition": "Definición"}
+DIRECTION_LABELS = {"positive": "positivo", "negative": "negativo", "mixed": "mixto", "unclear": "incierto"}
+BASIS_LABELS = {"stated_by_source": "lo dice el autor", "inferred_by_system": "deducido por el modelo"}
+
+
+def source_detail(store, source_id):
+    """Afirmaciones de un vídeo (última extracción), verificadas y no, listas para mostrar."""
+    source = store.get_source_by_id(source_id)
+    if source is None:
+        raise ValueError("Ese vídeo ya no está en la base.")
+    run = store.latest_run(source_id)
+    claims = []
+    for row in (store.claims_for_source(source_id, run_id=run["id"]) if run else []):
+        if row["status"] not in ("verified", "ungrounded"):
+            continue
+        metric = ""
+        if row["metric_value"] is not None:
+            metric = f"{row['metric_value']:g}".replace(".", ",") + (f" {row['metric_unit']}" if row["metric_unit"] else "")
+        link = ""
+        if row["ts_start"] is not None and source["platform"] == "youtube":
+            link = f"https://www.youtube.com/watch?v={source['external_id']}&t={int(row['ts_start'])}s"
+        implications = []
+        for item in store.implications_for(row["id"]):
+            text = f"{item['target_label']}: {DIRECTION_LABELS.get(item['direction'], item['direction'])}"
+            if item["mechanism"]:
+                text += f" — {item['mechanism']}"
+            implications.append(text + f" ({BASIS_LABELS.get(item['basis'], item['basis'])})")
+        claims.append({
+            "id": row["id"], "verified": row["status"] == "verified", "statement": row["statement"],
+            "kind": TYPE_LABELS.get(row["type"], row["type"]), "entity": row["entity_name"] or "",
+            "metric": metric, "time": digest.hms(row["ts_start"]) if row["ts_start"] is not None else "",
+            "link": link, "quote": row["quote"] or "",
+            "reasons": row["attrs"].get("grounding", {}).get("motivos", []),
+            "implications": implications})
+    return {"id": source_id, "title": source["title"] or source["external_id"], "url": source["url"] or "",
+            "claims": claims}
+
+
 def run_library(options):
-    """Lo que hay en la base: recuentos, vídeos guardados y búsqueda de afirmaciones verificadas."""
-    from rezme import Store
+    """Lo que hay en la base: recuentos, vídeos guardados, coste estimado de extraer y búsqueda."""
+    from rezme import Store, prompts
     from rezme.batch import ORIGIN_LABELS
+    from rezme.chunking import chunk_transcript, render
 
     if not options.get("db"):
         raise ValueError("No se encuentra la base de datos de reZme.")
     with Store(options["db"]) as store:
         stats = store.stats()
         by_status = stats["claims_by_status"]
+        chars_per_token, out_per_char, calibrated = _calibration(store)
+        overhead = len(prompts.system_prompt()) + len(prompts.load("user"))
+        waiting = {job["video_id"]: job for job in store.pending_jobs(stages=("extract",))}
         sources = []
         for row in store.list_sources():
             if row["n_cues"] is None:
                 continue
             frases = f"{row['n_cues']:,}".replace(",", ".")
-            sources.append({
+            item = {
                 "id": row["id"], "title": row["title"] or row["external_id"],
                 "channel": row["channel"] or "", "date": row["published_at"] or "",
                 "detail": f"{frases} frases · {ORIGIN_LABELS.get(row['origin'], row['origin'])}",
-                "verified": row["verified"], "url": row["url"] or ""})
-        # Lo que falta por extraer: vídeos con transcripción y sin afirmaciones, y llamadas estimadas.
-        from rezme.chunking import chunk_transcript
-        waiting = store.pending_jobs(stages=("extract",))
-        calls = 0
-        for job in waiting:
-            source = store.get_source("youtube", job["video_id"])
-            transcript = store.latest_transcript(source["id"]) if source else None
-            if transcript:
+                "verified": row["verified"], "url": row["url"] or ""}
+            job = waiting.get(row["external_id"])
+            if job:  # falta extraer: llamadas y tokens estimados
+                source = store.get_source_by_id(row["id"])
                 chapters = json.loads(source["chapters_json"]) if source.get("chapters_json") else None
-                calls += len(chunk_transcript(transcript["cues"], chapters, source.get("duration_s")))
+                chunks = chunk_transcript(store.latest_transcript(row["id"])["cues"], chapters,
+                                          source.get("duration_s"))
+                text = sum(len(render(chunk)) for chunk in chunks)
+                item.update(job=job["id"], calls=len(chunks),
+                            tokens_in=round((len(chunks) * overhead + text) / chars_per_token),
+                            tokens_out=round(text * out_per_char))
+            sources.append(item)
+        pending = [item for item in sources if "job" in item]
         emit("library", sources=sources, stats={
             "videos": len(sources), "verified": by_status.get("verified", 0),
             "ungrounded": by_status.get("ungrounded", 0), "entities": stats["entities"],
-            "to_extract": len(waiting), "calls": calls})
+            "to_extract": len(pending), "calls": sum(item["calls"] for item in pending),
+            "calibrated": calibrated})
+        if str(options.get("source") or "").isdigit():
+            emit("detail", **source_detail(store, int(options["source"])))
         query = options.get("query", "").strip()
         if query:
             titles = {row["id"]: row["title"] for row in store.list_sources()}

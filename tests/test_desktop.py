@@ -130,8 +130,13 @@ class DesktopTests(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 worker.run_library({"db": db})
-            plan = json.loads(output.getvalue().splitlines()[0])["stats"]
-            self.assertEqual((plan["to_extract"], plan["calls"]), (2, 2))
+            library = json.loads(output.getvalue().splitlines()[0])
+            plan = library["stats"]
+            self.assertEqual((plan["to_extract"], plan["calls"], plan["calibrated"]), (2, 2, 0))
+            first = library["sources"][0]
+            self.assertEqual((first["calls"], first["job"]), (1, 2))
+            self.assertGreater(first["tokens_in"], 2000)  # las instrucciones pesan más que el texto
+            self.assertGreater(first["tokens_out"], 0)
 
             with patch.object(worker, "call_meta", return_value=answer) as call:
                 events = self.queue(db, action="extract", engine="meta", key="secret-test", model="muse-spark-1.3")
@@ -142,11 +147,76 @@ class DesktopTests(unittest.TestCase):
                              [("done", "1 afirmaciones verificadas")] * 2)
             self.assertTrue(any("Uno · Tramo 1/1" in e.get("message", "") for e in events))
             self.assertEqual(events[-1]["type"], "done")
+            self.assertIn("gasto de la tanda", events[-1]["message"])
+            self.assertEqual(len([e for e in events if e["type"] == "spend"]), 2)
             self.assertNotIn("secret-test", json.dumps(events))
             with Store(db) as store:
                 self.assertEqual(store.stats()["claims_by_status"], {"verified": 2})
+                self.assertGreater(store.get_run(1)["stats"]["consumo"]["entrada"], 2000)
                 self.assertNotIn("secret-test", "\n".join(store.db.iterdump()))
                 self.assertEqual(store.get_run(1)["backend"], "meta")
+
+    def test_extract_respects_selection_budget_and_calibrates_estimates(self):
+        import tempfile
+        from rezme import Store
+        answer = json.dumps({"entities": [], "claims": []})
+
+        def meta(prompt, key, model, system=None, usage=None):
+            usage.update(prompt_tokens=100_000, completion_tokens=50_000)
+            return answer
+
+        options = dict(action="extract", engine="meta", key="k", model="m", price_in="2", price_out="10")
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.extraction_db(tmp)
+            # Solo el vídeo elegido (trabajo 2), aunque haya dos pendientes.
+            with patch.object(worker, "call_meta", side_effect=meta) as call:
+                events = self.queue(db, ids="2", budget="5", **options)
+            self.assertEqual(call.call_count, 1)
+            spend = [e for e in events if e["type"] == "spend"][-1]
+            self.assertEqual((spend["cost"], spend["tokens_in"], spend["tokens_out"]), (0.7, 100_000, 50_000))
+            with Store(db) as store:
+                self.assertEqual([j["status"] for j in store.list_jobs()], ["pending", "done"])
+                self.assertAlmostEqual(store.get_run(1)["cost_usd"], 0.7)
+
+            # Con lo medido, la estimación del que queda deja de ser la de por defecto.
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                worker.run_library({"db": db})
+            library = json.loads(output.getvalue().splitlines()[0])
+            pending = [item for item in library["sources"] if "job" in item][0]
+            self.assertEqual(library["stats"]["calibrated"], 1)
+            self.assertGreater(pending["tokens_out"], 40_000)
+
+    def test_extract_stops_when_the_budget_is_reached(self):
+        import tempfile
+        from rezme import Store
+        cues = [(i * 30.0, f"frase {i} con algo de contenido") for i in range(80)]  # 40 min: 4-5 tramos
+
+        def meta(prompt, key, model, system=None, usage=None):
+            usage.update(prompt_tokens=100_000, completion_tokens=0)
+            return json.dumps({"entities": [], "claims": []})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.extraction_db(tmp)
+            with Store(db) as store:
+                store.save_transcript(1, cues, "whisper")
+            with patch.object(worker, "call_meta", side_effect=meta) as call:
+                events = self.queue(db, action="extract", engine="meta", key="k", model="m",
+                                    price_in="2", price_out="10", budget="0.5")
+            self.assertEqual(call.call_count, 3)  # 0,20 $ por llamada: la cuarta ya no se hace
+            self.assertIn("Tope de gasto alcanzado (0.60 $)", events[-1]["message"])
+            with Store(db) as store:
+                self.assertEqual({j["status"] for j in store.list_jobs()}, {"pending"})
+                done = store.get_run(1)["stats"]["tramos"]
+                self.assertEqual(len([t for t in done.values() if t["estado"] == "ok"]), 3)
+            # Otra tanda continúa donde se quedó, sin repetir tramos.
+            with patch.object(worker, "call_meta", side_effect=meta) as call:
+                self.queue(db, action="extract", engine="meta", key="k", model="m",
+                           price_in="2", price_out="10", budget="50")
+            with Store(db) as store:
+                tramos = len(store.get_run(1)["stats"]["tramos"])
+                self.assertEqual(call.call_count, tramos - 3 + 1)  # lo que faltaba + el segundo vídeo
+                self.assertEqual({j["status"] for j in store.list_jobs()}, {"done"})
 
     def test_extract_stops_at_once_when_the_key_is_rejected(self):
         import tempfile
@@ -180,7 +250,7 @@ class DesktopTests(unittest.TestCase):
 
     def test_library_lists_saved_videos_and_searches_verified_claims(self):
         import os, tempfile
-        from rezme import Claim, Store
+        from rezme import Claim, Implication, Store
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "rezme.db")
             with Store(db) as store:
@@ -193,14 +263,35 @@ class DesktopTests(unittest.TestCase):
                                       type="statistic", status="verified", entity_id=entity, ts_start=75))
                 store.add_claim(Claim(source_id=src, statement="La inflación se dispara.", type="opinion",
                                       status="ungrounded"))
+                run = store.start_run(source_id=src, prompt_version="v1")
+                good, _ = store.add_claim(Claim(
+                    source_id=src, run_id=run, statement="El petróleo supera los 100 dólares.", type="risk",
+                    status="verified", entity_id=entity, metric_value=100.0, metric_unit="USD", ts_start=235.4,
+                    quote="el petróleo por encima de $100"))
+                store.add_implication(Implication(claim_id=good, direction="negative", basis="inferred_by_system",
+                                                  target_label="bonos largos", mechanism="más inflación"))
+                store.add_claim(Claim(source_id=src, run_id=run, statement="Bajó una décima.", type="statistic",
+                                      status="ungrounded", metric_value=0.1,
+                                      attrs={"grounding": {"ok": False, "motivos": ["la cifra 0.1 no aparece en el tramo"]}}))
+                store.add_claim(Claim(source_id=src, run_id=run, statement="Versión antigua.", type="fact",
+                                      status="superseded"))
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                worker.run_library({"db": db, "query": "inflacion"})
-            library, hits = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(library["stats"], {"videos": 1, "verified": 1, "ungrounded": 1, "entities": 1,
-                                            "to_extract": 0, "calls": 0})
+                worker.run_library({"db": db, "query": "inflacion", "source": str(src)})
+            library, detail, hits = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual((detail["type"], detail["title"], len(detail["claims"])), ("detail", "Macro 2027", 2))
+        claim = detail["claims"][0]
+        self.assertEqual((claim["verified"], claim["kind"], claim["entity"], claim["metric"], claim["time"]),
+                         (True, "Riesgo", "IPC", "100 USD", "00:03:55"))
+        self.assertEqual(claim["link"], "https://www.youtube.com/watch?v=aaaaaaaaaa1&t=235s")
+        self.assertEqual(claim["implications"], ["bonos largos: negativo — más inflación (deducido por el modelo)"])
+        self.assertEqual((detail["claims"][1]["verified"], detail["claims"][1]["reasons"]),
+                         (False, ["la cifra 0.1 no aparece en el tramo"]))
+        self.assertEqual(library["stats"], {"videos": 1, "verified": 2, "ungrounded": 2, "entities": 1,
+                                            "to_extract": 0, "calls": 0, "calibrated": 0})
+        self.assertNotIn("job", library["sources"][0])
         self.assertEqual(library["sources"][0]["detail"], "1.200 frases · subtítulos automáticos")
-        self.assertEqual((library["sources"][0]["title"], library["sources"][0]["verified"]), ("Macro 2027", 1))
+        self.assertEqual((library["sources"][0]["title"], library["sources"][0]["verified"]), ("Macro 2027", 2))
         self.assertEqual([h["statement"] for h in hits["items"]], ["La inflación subyacente baja al 2,4 %."])
         self.assertEqual(hits["items"][0]["meta"], "statistic · IPC · Macro 2027 · 00:01:15")
 
