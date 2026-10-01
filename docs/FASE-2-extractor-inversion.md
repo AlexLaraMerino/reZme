@@ -230,4 +230,9 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   en varias dimensiones y búsqueda semántica (M4).
 - La migración v3 → v4 reconstruye la tabla `claims` y deja antes una copia
   `rezme.db.v3.bak` junto a la base.
+- Prompt v4: con v3 el modelo dejaba vacías las relaciones y la condición de
+  las implicaciones. Ahora se le pide repasar la lista y enlazar las
+  afirmaciones del tramo (dato que apoya una idea, ejemplo de un mecanismo,
+  causa, matiz, contradicción) y condicionar cada implicación salvo que el
+  efecto sea incondicional.
 

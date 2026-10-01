@@ -571,6 +571,10 @@ class ExtractTests(ExtractBase):
         self.assertIn("Salida compacta", system)
         self.assertIn("Como máximo 18 afirmaciones", system)
         self.assertIn("Conocimiento que dura", system)
+        self.assertIn("Implicaciones condicionadas", system)
+        self.assertIn("repasa tu lista de `claims`", system)
+        numbered = [line[:2] for line in system.splitlines() if line[:1].isdigit() and line[1:2] == "."]
+        self.assertEqual(numbered, [f"{n}." for n in range(1, 10)])  # reglas numeradas sin saltos
         self.assertIn("counterexample_of", system)   # vocabularios nuevos inyectados desde el esquema
         self.assertIn("competitive_advantage", system)
         self.assertNotIn("{{", system)

@@ -8,7 +8,7 @@ from ..schema import (
     RELATION_TYPES, STANCES,
 )
 
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"
 DOMAINS = ("macro", "empresa", "ciencia", "cripto")
 _DIR = Path(__file__).resolve().parent
 
