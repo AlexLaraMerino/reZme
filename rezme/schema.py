@@ -14,11 +14,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 CLAIM_TYPES = (
     "fact", "statistic", "study_result", "causal_claim", "forecast", "opinion",
     "own_calculation", "recommendation", "risk", "catalyst", "methodology", "definition",
+    # Conocimiento que dura: cómo funciona algo, no qué pasó ayer.
+    "mechanism", "mental_model", "heuristic", "framework", "historical_case",
 )
 EVIDENCE_GRADES = (
     "primary_data", "peer_reviewed", "official_stat", "cited_secondary",
@@ -35,6 +37,15 @@ ENTITY_TYPES = (
 DIRECTIONS = ("positive", "negative", "mixed", "unclear")
 # stated_by_source: lo dice el autor. inferred_by_system: lo deduce el modelo.
 IMPLICATION_BASES = ("stated_by_source", "inferred_by_system")
+# Para qué decisión de inversión sirve una afirmación (mejora la recuperación por los agentes).
+DECISION_TAGS = (
+    "valuation", "business_quality", "competitive_advantage", "management", "capital_allocation",
+    "accounting", "risk", "position_sizing", "market_structure", "macro", "liquidity", "behavioral",
+)
+RELATION_TYPES = (
+    "supports", "contradicts", "refines", "causes", "caused_by", "example_of",
+    "counterexample_of", "depends_on", "related_to", "generalizes", "specializes",
+)
 TRANSCRIPT_ORIGINS = ("subtitles_manual", "subtitles_auto", "whisper", "pasted")
 FORECAST_RESOLUTIONS = ("pending", "correct", "incorrect", "partial", "void")
 JOB_STATUSES = ("pending", "running", "done", "failed", "skipped")
@@ -47,11 +58,18 @@ SHELF_LIFE_DAYS: dict[str, int | None] = {
     "fact": 730, "statistic": 120, "study_result": 1825, "causal_claim": 1095,
     "forecast": 365, "opinion": 90, "own_calculation": 180, "recommendation": 60,
     "risk": 180, "catalyst": 180, "methodology": None, "definition": None,
+    "mechanism": None, "mental_model": None, "heuristic": None, "framework": None,
+    "historical_case": None,
 }
 
 MAX_STATEMENT_CHARS = 1000
 # Cita literal corta: sirve para verificar, no para reproducir el contenido.
 MAX_QUOTE_CHARS = 300
+MAX_TITLE_CHARS = 150
+# Mecanismo, condiciones de aplicación y de fallo: listas cortas de frases.
+MAX_ITEMS = 6
+MAX_ITEM_CHARS = 400
+KNOWLEDGE_FIELDS = ("mechanism", "applies_when", "fails_when")
 
 
 class ValidationError(ValueError):
@@ -193,6 +211,13 @@ class Claim:
     transcript_id: int | None = None
     published_at: str | None = None
     expires_at: str | None = None
+    # K = afirmación + mecanismo + cuándo aplica + cuándo falla. Cada elemento de las listas es
+    # {"text", "basis"[, "quote"]}: `basis` dice si lo afirma el autor o lo deduce el sistema.
+    title: str | None = None
+    mechanism: list[dict[str, Any]] = field(default_factory=list)
+    applies_when: list[dict[str, Any]] = field(default_factory=list)
+    fails_when: list[dict[str, Any]] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
 
     def validate(self) -> "Claim":
         _check_choice("type", self.type, CLAIM_TYPES)
@@ -222,6 +247,28 @@ class Claim:
             raise ValidationError("valid_to anterior a valid_from")
         if not isinstance(self.attrs, dict):
             raise ValidationError("attrs debe ser un objeto")
+        if self.title is not None and (not isinstance(self.title, str)
+                                       or len(self.title) > MAX_TITLE_CHARS):
+            raise ValidationError(f"title debe ser un texto de hasta {MAX_TITLE_CHARS} caracteres")
+        for name in KNOWLEDGE_FIELDS:
+            items = getattr(self, name)
+            if not isinstance(items, list) or len(items) > MAX_ITEMS:
+                raise ValidationError(f"{name} debe ser una lista de hasta {MAX_ITEMS} elementos")
+            for item in items:
+                if not isinstance(item, dict) or set(item) - {"text", "basis", "quote"}:
+                    raise ValidationError(f"{name}: cada elemento es un objeto con text, basis y quote")
+                text = item.get("text")
+                if not isinstance(text, str) or not text.strip() or len(text) > MAX_ITEM_CHARS:
+                    raise ValidationError(
+                        f"{name}: text debe ser un texto de hasta {MAX_ITEM_CHARS} caracteres")
+                _check_choice(f"{name}.basis", item.get("basis"), IMPLICATION_BASES)
+                quote = item.get("quote")
+                if quote is not None and (not isinstance(quote, str) or len(quote) > MAX_QUOTE_CHARS):
+                    raise ValidationError(f"{name}: quote supera {MAX_QUOTE_CHARS} caracteres")
+        if not isinstance(self.tags, list):
+            raise ValidationError("tags debe ser una lista")
+        for tag in self.tags:
+            _check_choice("tags", tag, DECISION_TAGS)
         return self
 
     def fingerprint(self) -> str:
@@ -246,6 +293,7 @@ class Implication:
     horizon: str | None = None
     strength: float | None = None
     confidence: float | None = None
+    conditional_on: str | None = None  # la misma idea puede ser positiva o negativa según el contexto
 
     def validate(self) -> "Implication":
         _check_choice("direction", self.direction, DIRECTIONS)

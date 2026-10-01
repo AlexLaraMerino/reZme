@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from rezme import SCHEMA_VERSION, Store, batch, cli
+from rezme import SCHEMA_VERSION, Claim, Implication, Store, batch, cli
 from rezme import ingest as ing
 from rezme.schema import ValidationError
 
@@ -115,12 +115,23 @@ class MigrationTests(unittest.TestCase):
             with Store(path) as store:
                 self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0],
                                  SCHEMA_VERSION)
-                self.assertEqual(SCHEMA_VERSION, 3)
+                self.assertEqual(SCHEMA_VERSION, 4)
                 stats = store.stats()
                 self.assertEqual((stats["sources"], stats["transcripts"], stats["claims"],
                                   stats["extraction_runs"], stats["jobs"]), (1, 1, 1, 1, 0))
                 self.assertEqual(store.latest_transcript(1)["cues"], [(0.0, "hola")])
-                self.assertEqual(len(store.search_claims("espectral")), 1)  # el índice FTS sigue
+                hit = store.search_claims("espectral")[0]  # el índice de búsqueda se reconstruye
+                self.assertEqual((hit["statement"], hit["mechanism"], hit["tags"], hit["title"]),
+                                 ("La eficiencia espectral es baja", [], [], None))
+                self.assertTrue(os.path.exists(path + ".v3.bak"))  # copia de seguridad previa
+                # La tabla reconstruida admite los tipos nuevos y sigue enlazada con el resto.
+                new_id, _ = store.add_claim(Claim(source_id=1, statement="El apalancamiento operativo amplifica.",
+                                                  type="mechanism", status="verified", title="Apalancamiento"))
+                store.add_implication(Implication(claim_id=new_id, direction="mixed", basis="inferred_by_system",
+                                                  target_label="márgenes", conditional_on="capacidad ociosa"))
+                self.assertTrue(store.add_relation(new_id, "related_to", hit["id"]))
+                self.assertEqual(len(store.search_claims("apalancamiento")), 2 - 1)
+                self.assertEqual(store.db.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(store.get_run(1)["stats"], {})
                 job_id, created = store.enqueue_job("aaaaaaaaaa1", url("aaaaaaaaaa1"))
                 self.assertTrue(created)

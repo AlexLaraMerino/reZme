@@ -286,7 +286,7 @@ class ExtractTests(ExtractBase):
 
         run = self.store.get_run(result.run_id)
         self.assertEqual((run["backend"], run["model"], run["prompt_version"], run["source_id"]),
-                         ("falso", "m1", "v2", self.src))
+                         ("falso", "m1", prompts.PROMPT_VERSION, self.src))
         self.assertIsNone(run["cost_usd"])
         tramo = run["stats"]["tramos"]["0"]
         self.assertEqual((tramo["estado"], tramo["verified"], tramo["implicaciones_degradadas"]),
@@ -417,7 +417,7 @@ class ExtractTests(ExtractBase):
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'claims_fts%'")}
         self.assertEqual(tables, {"sources", "transcripts", "extraction_runs", "entities",
                                   "entity_aliases", "claims", "implications", "forecasts",
-                                  "source_profiles", "jobs"})
+                                  "source_profiles", "jobs", "claim_relations"})
         self.assertEqual(self.store.stats()["jobs"], 0)  # extraer no encola trabajo alguno
 
     def test_transcript_cannot_close_its_own_tag(self):
@@ -445,13 +445,13 @@ class ExtractTests(ExtractBase):
     def test_new_prompt_version_creates_new_run_and_keeps_history(self):
         first, _ = self.run_with(response(claim_json()))
         with tempfile.TemporaryDirectory() as tmp:
-            for version in ("v2", "v3"):
-                shutil.copytree(Path(prompts.__file__).parent / "v2", Path(tmp) / version)
+            for version in (prompts.PROMPT_VERSION, "v99"):
+                shutil.copytree(Path(prompts.__file__).parent / prompts.PROMPT_VERSION, Path(tmp) / version)
             with mock.patch.object(prompts, "_DIR", Path(tmp)):
-                second, llm = self.run_with(response(claim_json()), prompt_version="v3")
+                second, llm = self.run_with(response(claim_json()), prompt_version="v99")
         self.assertEqual(len(llm.calls), 1)
         self.assertNotEqual(second.run_id, first.run_id)
-        self.assertEqual(self.store.get_run(second.run_id)["prompt_version"], "v3")
+        self.assertEqual(self.store.get_run(second.run_id)["prompt_version"], "v99")
         by_run = {c["run_id"]: c["status"] for c in self.claims()}
         self.assertEqual(by_run, {first.run_id: "superseded", second.run_id: "verified"})
         self.assertEqual(second.superseded, 1)
@@ -459,7 +459,7 @@ class ExtractTests(ExtractBase):
 
     def test_domain_changes_prompt_and_version_label(self):
         result, llm = self.run_with(response(), domain="macro")
-        self.assertEqual(result.prompt_version, "v2+macro")
+        self.assertEqual(result.prompt_version, prompts.PROMPT_VERSION + "+macro")
         self.assertIn("Macro y economía", llm.calls[0][0])
         self.assertNotIn("### Cripto", llm.calls[0][0])
         with self.assertRaisesRegex(ValueError, "Dominio no válido"):
@@ -502,6 +502,64 @@ class ExtractTests(ExtractBase):
             self.assertEqual((usage["entrada"], usage["salida"], usage["llamadas"]), (1000, 200, 1))
             self.assertGreater(usage["caracteres_prompt"], usage["caracteres_transcripcion"])
 
+    def knowledge_json(self, **changes):
+        base = claim_json(
+            statement="Los costes fijos altos amplifican el efecto de los ingresos sobre el beneficio.",
+            type="mechanism", metric_name=None, metric_value=None, metric_unit=None,
+            title="Apalancamiento operativo",
+            quote="Yo estimo que la eficiencia espectral realista, con doble polarización",
+            mechanism=[
+                {"text": "El autor estima la eficiencia con doble polarización.", "basis": "stated_by_source",
+                 "quote": "con doble polarización, es de 1,36 bits por segundo y hercio"},
+                {"text": "Esto lo afirma el modelo como si fuera del autor.", "basis": "stated_by_source",
+                 "quote": "una frase que el autor nunca pronuncia en el vídeo"},
+                "Un paso escrito como texto suelto."],
+            applies_when=[{"text": "Hay capacidad ociosa.", "basis": "inferred_by_system", "quote": "sobra"}],
+            fails_when=[{"text": "Los costes variables crecen al ritmo de las ventas.", "extra": 1}],
+            tags=["valuation", "risk", "astrología", "risk"],
+            relations=[{"to": 1, "relation": "supports"}, {"to": 0, "relation": "supports"},
+                       {"to": 9, "relation": "supports"}, {"to": 1, "relation": "inventada"}])
+        base.update(changes)
+        return base
+
+    def test_knowledge_fields_are_stored_with_honest_basis(self):
+        result, _ = self.run_with(response(self.knowledge_json(), claim_json()))
+        self.assertEqual((result.claims_new, result.verified), (2, 2))
+        claim = self.store.search_claims("apalancamiento operativo")[0]  # el título también se busca
+        self.assertEqual((claim["type"], claim["title"], claim["expires_at"]),
+                         ("mechanism", "Apalancamiento operativo", None))  # el conocimiento que dura no caduca
+        # Solo es «dicho por el autor» lo que lleva una cita que está en el tramo.
+        self.assertEqual([(m["basis"], "quote" in m) for m in claim["mechanism"]],
+                         [("stated_by_source", True), ("inferred_by_system", False),
+                          ("inferred_by_system", False)])
+        self.assertEqual(claim["applies_when"], [{"text": "Hay capacidad ociosa.", "basis": "inferred_by_system"}])
+        self.assertEqual(claim["fails_when"][0]["basis"], "inferred_by_system")
+        self.assertEqual(claim["tags"], ["valuation", "risk"])
+        relations = self.store.relations_for(claim["id"])
+        self.assertEqual([(r["relation"], r["direction"], r["other_statement"]) for r in relations],
+                         [("supports", "out", claim_json()["statement"])])
+        tramo = self.store.get_run(result.run_id)["stats"]["tramos"]["0"]
+        self.assertEqual((tramo["conocimiento_degradado"], tramo["relaciones"]), (1, 1))
+        for ignored in ("claims[0].tags.astrología", "claims[0].fails_when[0].extra", "claims[0].relations"):
+            self.assertIn(ignored, tramo["campos_ignorados"])
+
+    def test_invalid_knowledge_fields_are_rejected(self):
+        for bad in (dict(mechanism="texto"), dict(applies_when=[{"basis": "inferred_by_system"}]),
+                    dict(fails_when=[{"text": "x", "basis": "me lo invento"}]), dict(tags="risk"),
+                    dict(title="x" * 151), dict(mechanism=[{"text": "y" * 401}])):
+            parsed = ex.parse_response(response(self.knowledge_json(**bad)), 1)
+            self.assertEqual((len(parsed.candidates), len(parsed.errors)), (0, 1), bad)
+        long_list = ex.parse_response(response(self.knowledge_json(mechanism=["paso"] * 9)), 1)
+        self.assertEqual(len(long_list.candidates[0].claim.mechanism), 6)  # se recorta, no se rechaza
+
+    def test_implication_keeps_its_condition(self):
+        self.run_with(response(claim_json(implications=[
+            {"target": "márgenes operativos", "direction": "positive", "basis": "inferred_by_system",
+             "conditional_on": "crecimiento de ingresos con capacidad ociosa"}])))
+        claim = self.claims()[0]
+        self.assertEqual(self.store.implications_for(claim["id"])[0]["conditional_on"],
+                         "crecimiento de ingresos con capacidad ociosa")
+
     def test_truncated_chunk_is_stored_and_flagged_without_retry(self):
         full = response(claim_json(), claim_json(statement="Se corta aquí."))
         result, llm = self.run_with(full[:full.index("Se corta") + 5])
@@ -511,7 +569,11 @@ class ExtractTests(ExtractBase):
     def test_prompt_asks_for_compact_output(self):
         system = prompts.system_prompt()
         self.assertIn("Salida compacta", system)
-        self.assertIn("Como máximo 25 afirmaciones", system)
+        self.assertIn("Como máximo 18 afirmaciones", system)
+        self.assertIn("Conocimiento que dura", system)
+        self.assertIn("counterexample_of", system)   # vocabularios nuevos inyectados desde el esquema
+        self.assertIn("competitive_advantage", system)
+        self.assertNotIn("{{", system)
         self.assertNotIn(": null", system)
 
     def test_missing_source_or_transcript(self):
@@ -722,16 +784,9 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "k.db")
             db = sqlite3.connect(path)
-            db.executescript("""
-                CREATE TABLE sources (id INTEGER PRIMARY KEY, platform TEXT, external_id TEXT);
-                CREATE TABLE transcripts (id INTEGER PRIMARY KEY);
-                CREATE TABLE extraction_runs (id INTEGER PRIMARY KEY, model TEXT, backend TEXT,
-                    prompt_version TEXT, schema_version INTEGER NOT NULL, cost_usd REAL,
-                    notes TEXT, created_at TEXT NOT NULL);
-                INSERT INTO extraction_runs (model, schema_version, created_at)
-                    VALUES ('m', 1, 'antes');
-                PRAGMA user_version = 1;
-            """)
+            db.executescript((Path(__file__).parent / "fixtures" / "schema_v1.sql").read_text(encoding="utf-8"))
+            db.execute("INSERT INTO extraction_runs (model, schema_version, created_at) VALUES ('m', 1, 'antes')")
+            db.commit()
             db.close()
             with Store(path) as store:
                 run = store.get_run(1)

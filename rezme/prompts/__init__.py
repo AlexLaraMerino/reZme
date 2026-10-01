@@ -4,10 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..schema import (
-    CLAIM_TYPES, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES, IMPLICATION_BASES, STANCES,
+    CLAIM_TYPES, DECISION_TAGS, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES, IMPLICATION_BASES,
+    RELATION_TYPES, STANCES,
 )
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 DOMAINS = ("macro", "empresa", "ciencia", "cripto")
 _DIR = Path(__file__).resolve().parent
 
@@ -41,4 +42,5 @@ def system_prompt(domain: str | None = None, version: str = PROMPT_VERSION) -> s
         CLAIM_TYPES=", ".join(CLAIM_TYPES), EVIDENCE_GRADES=", ".join(EVIDENCE_GRADES),
         STANCES=", ".join(STANCES), ENTITY_TYPES=", ".join(ENTITY_TYPES),
         DIRECTIONS=", ".join(DIRECTIONS), IMPLICATION_BASES=", ".join(IMPLICATION_BASES),
+        DECISION_TAGS=", ".join(DECISION_TAGS), RELATION_TYPES=", ".join(RELATION_TYPES),
         GUIA_DOMINIO="## Guía por dominio\n\n" + "\n\n".join(guides))

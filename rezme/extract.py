@@ -24,7 +24,8 @@ from . import prompts
 from .backends import Backend, BackendUnavailable
 from .chunking import Chunk, chunk_transcript, hms, render
 from .schema import (
-    ENTITY_TYPES, Claim, Entity, Implication, ValidationError, normalize_name, parse_ts,
+    DECISION_TAGS, ENTITY_TYPES, IMPLICATION_BASES, KNOWLEDGE_FIELDS, MAX_ITEMS, RELATION_TYPES,
+    Claim, Entity, Implication, ValidationError, normalize_name, parse_ts,
 )
 from .store import AmbiguousEntity, Store
 from .verify import MIN_QUOTE_TOKENS, find_quote, verify_claim
@@ -33,9 +34,10 @@ _TEXT_FIELDS = ("domain", "metric_name", "metric_unit", "metric_period", "curren
                 "valid_from", "valid_to", "horizon", "quote")
 _CLAIM_KEYS = frozenset(_TEXT_FIELDS) | {
     "statement", "type", "entity", "evidence_grade", "stance", "metric_value", "ts_start",
-    "ts_end", "confidence", "attrs", "implications"}
+    "ts_end", "confidence", "attrs", "implications", "title", "tags", "relations",
+    *KNOWLEDGE_FIELDS}
 _IMPLICATION_KEYS = frozenset({"target", "direction", "basis", "mechanism", "horizon",
-                               "strength", "confidence", "quote"})
+                               "strength", "confidence", "quote", "conditional_on"})
 _ENTITY_KEYS = frozenset({"name", "type", "aliases", "external_ids"})
 _TOP_KEYS = frozenset({"entities", "claims"})
 # Claves de attrs que escribe el sistema; el modelo no puede fijarlas.
@@ -61,6 +63,8 @@ class Candidate:
     claim: Claim
     entity: str | None
     implications: list[ImplicationCandidate] = field(default_factory=list)
+    index: int = -1  # posición en la respuesta, para las relaciones entre afirmaciones
+    relations: list[tuple[int, str]] = field(default_factory=list)  # (posición destino, relación)
 
 
 @dataclass
@@ -244,8 +248,36 @@ def _build_implication(item: Any, path: str, ignored: list[str]) -> ImplicationC
     implication = Implication(
         claim_id=0, direction=item.get("direction"), basis=item.get("basis"),
         target_label=target, mechanism=_text(item, "mechanism"), horizon=_text(item, "horizon"),
-        strength=_number(item, "strength"), confidence=_number(item, "confidence")).validate()
+        strength=_number(item, "strength"), confidence=_number(item, "confidence"),
+        conditional_on=_text(item, "conditional_on")).validate()
     return ImplicationCandidate(implication, _text(item, "quote"))
+
+
+def _knowledge_items(raw: Any, name: str, path: str, ignored: list[str]) -> list[dict[str, Any]]:
+    """Lista de {"text", "basis"[, "quote"]}. Un texto suelto se toma como deducido por el sistema."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValidationError(f"{name} debe ser una lista")
+    items: list[dict[str, Any]] = []
+    for i, entry in enumerate(raw):
+        if len(items) >= MAX_ITEMS:
+            ignored.append(f"{path}.{name}[{i}]")
+            continue
+        if isinstance(entry, str):
+            entry = {"text": entry}
+        if not isinstance(entry, dict) or not isinstance(entry.get("text"), str) or not entry["text"].strip():
+            raise ValidationError(f"{name}[{i}] debe ser un objeto con text")
+        ignored.extend(f"{path}.{name}[{i}].{k}" for k in entry if k not in ("text", "basis", "quote"))
+        basis = entry.get("basis") or "inferred_by_system"
+        if basis not in IMPLICATION_BASES:
+            raise ValidationError(f"{name}[{i}].basis no válido: {basis!r}")
+        item: dict[str, Any] = {"text": entry["text"].strip(), "basis": basis}
+        quote = entry.get("quote")
+        if isinstance(quote, str) and quote.strip():
+            item["quote"] = quote.strip()
+        items.append(item)
+    return items
 
 
 def _build_claim(item: Any, source_id: int, path: str, parsed: Parsed) -> Candidate:
@@ -262,11 +294,28 @@ def _build_claim(item: Any, source_id: int, path: str, parsed: Parsed) -> Candid
         evidence_grade=item.get("evidence_grade") or "none", stance=item.get("stance") or "n/a",
         metric_value=_number(item, "metric_value"), confidence=_number(item, "confidence"),
         ts_start=_ts(item.get("ts_start")), ts_end=_ts(item.get("ts_end")),
-        attrs=_clean_attrs(item.get("attrs"), path, parsed.ignored), **fields)
+        attrs=_clean_attrs(item.get("attrs"), path, parsed.ignored),
+        title=_text(item, "title"), **fields,
+        **{name: _knowledge_items(item.get(name), name, path, parsed.ignored)
+           for name in KNOWLEDGE_FIELDS})
+    raw_tags = item.get("tags") or []
+    if not isinstance(raw_tags, list):
+        raise ValidationError("tags debe ser una lista")
+    for tag in raw_tags:  # las etiquetas desconocidas se ignoran, no invalidan la afirmación
+        if tag in DECISION_TAGS and tag not in claim.tags:
+            claim.tags.append(tag)
+        elif tag not in DECISION_TAGS:
+            parsed.ignored.append(f"{path}.tags.{tag}")
     if claim.ts_start is not None and claim.ts_end is not None and claim.ts_end < claim.ts_start:
         claim.ts_end = None
     claim.validate()
     candidate = Candidate(claim, _text(item, "entity"))
+    for raw in item.get("relations") or [] if isinstance(item.get("relations"), list) else []:
+        if (isinstance(raw, dict) and isinstance(raw.get("to"), int) and not isinstance(raw["to"], bool)
+                and raw.get("relation") in RELATION_TYPES):
+            candidate.relations.append((raw["to"], raw["relation"]))
+        else:
+            parsed.ignored.append(f"{path}.relations")
     raw_implications = item.get("implications") or []
     if not isinstance(raw_implications, list):
         raise ValidationError("implications debe ser una lista")
@@ -314,7 +363,9 @@ def parse_response(text: str, source_id: int) -> Parsed:
     for i, raw in enumerate(data["claims"]):
         path = f"claims[{i}]"
         try:
-            parsed.candidates.append(_build_claim(raw, source_id, path, parsed))
+            candidate = _build_claim(raw, source_id, path, parsed)
+            candidate.index = i
+            parsed.candidates.append(candidate)
         except ValidationError as exc:
             parsed.errors.append(f"{path}: {exc}")
     return parsed
@@ -383,11 +434,25 @@ def resolve_entity(store: Store, name: str, known: dict[str, Entity], *,
 def _store_chunk(store: Store, parsed: Parsed, chunk: Chunk, run_id: int, transcript_id: int,
                  result: ExtractResult) -> dict[str, Any]:
     info = {"claims": 0, "verified": 0, "ungrounded": 0, "implicaciones": 0,
-            "implicaciones_degradadas": 0}
+            "implicaciones_degradadas": 0, "conocimiento_degradado": 0, "relaciones": 0}
+
+    def said_by_author(quote: str | None) -> bool:
+        return (quote is not None and len(normalize_name(quote).split()) >= MIN_QUOTE_TOKENS
+                and find_quote(quote, chunk)[1] is not None)
+
+    stored: dict[int, int] = {}  # posición en la respuesta -> id de la afirmación
     for candidate in parsed.candidates:
         claim = candidate.claim
         claim.run_id, claim.transcript_id = run_id, transcript_id
         claim.attrs["tramo"] = {"indice": chunk.index, "inicio": chunk.start, "fin": chunk.end}
+        for name in KNOWLEDGE_FIELDS:  # sin prueba literal, no se atribuye al autor
+            for item in getattr(claim, name):
+                if item["basis"] == "stated_by_source" and not said_by_author(item.get("quote")):
+                    item["basis"] = "inferred_by_system"
+                    item.pop("quote", None)
+                    info["conocimiento_degradado"] += 1
+                elif item["basis"] != "stated_by_source":
+                    item.pop("quote", None)
         grounding = verify_claim(claim, chunk)
         if candidate.entity:
             claim.entity_id, note = resolve_entity(store, candidate.entity, parsed.entities,
@@ -395,6 +460,7 @@ def _store_chunk(store: Store, parsed: Parsed, chunk: Chunk, run_id: int, transc
             if note:
                 claim.attrs["entidad"] = note
         claim_id, created = store.add_claim(claim)
+        stored[candidate.index] = claim_id
         if not created:
             continue
         info["claims"] += 1
@@ -402,18 +468,19 @@ def _store_chunk(store: Store, parsed: Parsed, chunk: Chunk, run_id: int, transc
         for item in candidate.implications:
             implication = item.implication
             implication.claim_id = claim_id
-            if implication.basis == "stated_by_source":
-                quote_ok = (item.quote is not None
-                            and len(normalize_name(item.quote).split()) >= MIN_QUOTE_TOKENS
-                            and find_quote(item.quote, chunk)[1] is not None)
-                if not quote_ok:  # sin prueba literal, no se atribuye al autor
-                    implication.basis = "inferred_by_system"
-                    info["implicaciones_degradadas"] += 1
+            if implication.basis == "stated_by_source" and not said_by_author(item.quote):
+                implication.basis = "inferred_by_system"  # sin prueba literal, no se atribuye al autor
+                info["implicaciones_degradadas"] += 1
             target_id, _ = resolve_entity(store, implication.target_label or "", parsed.entities,
                                           create=grounding.ok)
             implication.target_entity_id = target_id
             store.add_implication(implication)
             info["implicaciones"] += 1
+    for candidate in parsed.candidates:
+        for target, relation in candidate.relations:
+            source_id, target_id = stored.get(candidate.index), stored.get(target)
+            if source_id and target_id and source_id != target_id:
+                info["relaciones"] += store.add_relation(source_id, relation, target_id)
     result.claims_new += info["claims"]
     result.verified += info["verified"]
     result.ungrounded += info["ungrounded"]

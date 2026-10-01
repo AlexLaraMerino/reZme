@@ -17,7 +17,8 @@ from typing import Any, Iterable
 
 from .schema import (
     CLAIM_STATUSES, CLAIM_TYPES, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES,
-    FORECAST_RESOLUTIONS, IMPLICATION_BASES, JOB_STAGES, JOB_STATUSES, SCHEMA_VERSION, STANCES,
+    FORECAST_RESOLUTIONS, IMPLICATION_BASES, JOB_STAGES, JOB_STATUSES, KNOWLEDGE_FIELDS,
+    RELATION_TYPES, SCHEMA_VERSION, STANCES,
     TRANSCRIPT_ORIGINS, Claim, Entity, Implication, ValidationError,
     default_expires_at, normalize_name, utc_now,
 )
@@ -30,6 +31,75 @@ class AmbiguousEntity(ValueError):
 def _in(values: Iterable[str]) -> str:
     return ", ".join("'" + v.replace("'", "''") + "'" for v in values)
 
+
+CLAIMS_TABLE_DDL = f"""
+CREATE TABLE claims (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    transcript_id INTEGER REFERENCES transcripts(id) ON DELETE SET NULL,
+    run_id INTEGER REFERENCES extraction_runs(id) ON DELETE SET NULL,
+    entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+    type TEXT NOT NULL CHECK (type IN ({_in(CLAIM_TYPES)})),
+    domain TEXT,
+    statement TEXT NOT NULL,
+    evidence_grade TEXT NOT NULL CHECK (evidence_grade IN ({_in(EVIDENCE_GRADES)})),
+    stance TEXT NOT NULL CHECK (stance IN ({_in(STANCES)})),
+    metric_name TEXT, metric_value REAL, metric_unit TEXT,
+    metric_period TEXT, currency TEXT,
+    as_of TEXT, valid_from TEXT, valid_to TEXT, horizon TEXT,
+    ts_start REAL, ts_end REAL, quote TEXT, confidence REAL,
+    attrs_json TEXT NOT NULL DEFAULT '{{}}',
+    status TEXT NOT NULL CHECK (status IN ({_in(CLAIM_STATUSES)})),
+    published_at TEXT, captured_at TEXT NOT NULL, expires_at TEXT,
+    fingerprint TEXT NOT NULL,
+    title TEXT,
+    mechanism_json TEXT NOT NULL DEFAULT '[]',
+    applies_when_json TEXT NOT NULL DEFAULT '[]',
+    fails_when_json TEXT NOT NULL DEFAULT '[]',
+    tags_json TEXT NOT NULL DEFAULT '[]'
+);
+"""
+
+# Índices, búsqueda de texto y disparadores de `claims` (se recrean al reconstruir la tabla).
+CLAIMS_EXTRAS_DDL = """
+CREATE UNIQUE INDEX idx_claim_dedupe ON claims(source_id, IFNULL(run_id, 0), fingerprint);
+CREATE INDEX idx_claim_entity ON claims(entity_id);
+CREATE INDEX idx_claim_status ON claims(status, expires_at);
+
+CREATE VIRTUAL TABLE claims_fts USING fts5(
+    title, statement, quote, content='claims', content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER claims_ai AFTER INSERT ON claims BEGIN
+    INSERT INTO claims_fts(rowid, title, statement, quote)
+    VALUES (new.id, new.title, new.statement, new.quote);
+END;
+CREATE TRIGGER claims_ad AFTER DELETE ON claims BEGIN
+    INSERT INTO claims_fts(claims_fts, rowid, title, statement, quote)
+    VALUES ('delete', old.id, old.title, old.statement, old.quote);
+END;
+CREATE TRIGGER claims_au AFTER UPDATE OF title, statement, quote ON claims BEGIN
+    INSERT INTO claims_fts(claims_fts, rowid, title, statement, quote)
+    VALUES ('delete', old.id, old.title, old.statement, old.quote);
+    INSERT INTO claims_fts(rowid, title, statement, quote)
+    VALUES (new.id, new.title, new.statement, new.quote);
+END;
+
+"""
+
+RELATIONS_DDL = f"""
+CREATE TABLE claim_relations (
+    id INTEGER PRIMARY KEY,
+    from_claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL CHECK (relation IN ({_in(RELATION_TYPES)})),
+    to_claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    basis TEXT NOT NULL CHECK (basis IN ({_in(IMPLICATION_BASES)})),
+    created_at TEXT NOT NULL,
+    UNIQUE (from_claim_id, relation, to_claim_id),
+    CHECK (from_claim_id != to_claim_id)
+);
+CREATE INDEX idx_relation_to ON claim_relations(to_claim_id);
+"""
 
 # Cola de procesamiento por lotes: un trabajo por vídeo.
 JOBS_DDL = f"""
@@ -104,47 +174,7 @@ CREATE TABLE entity_aliases (
 );
 CREATE INDEX idx_alias_norm ON entity_aliases(norm_alias);
 
-CREATE TABLE claims (
-    id INTEGER PRIMARY KEY,
-    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    transcript_id INTEGER REFERENCES transcripts(id) ON DELETE SET NULL,
-    run_id INTEGER REFERENCES extraction_runs(id) ON DELETE SET NULL,
-    entity_id INTEGER REFERENCES entities(id) ON DELETE SET NULL,
-    type TEXT NOT NULL CHECK (type IN ({_in(CLAIM_TYPES)})),
-    domain TEXT,
-    statement TEXT NOT NULL,
-    evidence_grade TEXT NOT NULL CHECK (evidence_grade IN ({_in(EVIDENCE_GRADES)})),
-    stance TEXT NOT NULL CHECK (stance IN ({_in(STANCES)})),
-    metric_name TEXT, metric_value REAL, metric_unit TEXT,
-    metric_period TEXT, currency TEXT,
-    as_of TEXT, valid_from TEXT, valid_to TEXT, horizon TEXT,
-    ts_start REAL, ts_end REAL, quote TEXT, confidence REAL,
-    attrs_json TEXT NOT NULL DEFAULT '{{}}',
-    status TEXT NOT NULL CHECK (status IN ({_in(CLAIM_STATUSES)})),
-    published_at TEXT, captured_at TEXT NOT NULL, expires_at TEXT,
-    fingerprint TEXT NOT NULL
-);
-CREATE UNIQUE INDEX idx_claim_dedupe ON claims(source_id, IFNULL(run_id, 0), fingerprint);
-CREATE INDEX idx_claim_entity ON claims(entity_id);
-CREATE INDEX idx_claim_status ON claims(status, expires_at);
-
-CREATE VIRTUAL TABLE claims_fts USING fts5(
-    statement, quote, content='claims', content_rowid='id',
-    tokenize='unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER claims_ai AFTER INSERT ON claims BEGIN
-    INSERT INTO claims_fts(rowid, statement, quote) VALUES (new.id, new.statement, new.quote);
-END;
-CREATE TRIGGER claims_ad AFTER DELETE ON claims BEGIN
-    INSERT INTO claims_fts(claims_fts, rowid, statement, quote)
-    VALUES ('delete', old.id, old.statement, old.quote);
-END;
-CREATE TRIGGER claims_au AFTER UPDATE OF statement, quote ON claims BEGIN
-    INSERT INTO claims_fts(claims_fts, rowid, statement, quote)
-    VALUES ('delete', old.id, old.statement, old.quote);
-    INSERT INTO claims_fts(rowid, statement, quote) VALUES (new.id, new.statement, new.quote);
-END;
-
+{CLAIMS_TABLE_DDL}{CLAIMS_EXTRAS_DDL}
 CREATE TABLE implications (
     id INTEGER PRIMARY KEY,
     claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
@@ -154,6 +184,7 @@ CREATE TABLE implications (
     mechanism TEXT, horizon TEXT, strength REAL, confidence REAL,
     basis TEXT NOT NULL CHECK (basis IN ({_in(IMPLICATION_BASES)})),
     created_at TEXT NOT NULL,
+    conditional_on TEXT,
     CHECK (target_entity_id IS NOT NULL OR target_label IS NOT NULL)
 );
 CREATE INDEX idx_impl_claim ON implications(claim_id);
@@ -176,7 +207,7 @@ CREATE TABLE source_profiles (
     updated_at TEXT NOT NULL,
     UNIQUE (platform, channel_id)
 );
-""" + JOBS_DDL
+""" + JOBS_DDL + RELATIONS_DDL
 
 # Pasos desde cada versión antigua hasta la actual.
 _MIGRATIONS = {
@@ -189,8 +220,15 @@ ALTER TABLE extraction_runs ADD COLUMN stats_json TEXT NOT NULL DEFAULT '{}';
     2: JOBS_DDL,
 }
 
+# Columnas de `claims` anteriores a la v4, para copiar los datos al reconstruir la tabla.
+_CLAIM_COLUMNS_V3 = (
+    "id, source_id, transcript_id, run_id, entity_id, type, domain, statement, evidence_grade, "
+    "stance, metric_name, metric_value, metric_unit, metric_period, currency, as_of, valid_from, "
+    "valid_to, horizon, ts_start, ts_end, quote, confidence, attrs_json, status, published_at, "
+    "captured_at, expires_at, fingerprint")
+
 _STATS_TABLES = ("sources", "transcripts", "entities", "claims", "implications",
-                 "forecasts", "extraction_runs", "jobs")
+                 "forecasts", "extraction_runs", "jobs", "claim_relations")
 _JOB_FIELDS = frozenset({"status", "stage", "attempts", "last_error", "priority", "started_at",
                          "finished_at", "notes", "title"})
 
@@ -205,6 +243,15 @@ def _fts_query(text: str) -> str:
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _claim(row: sqlite3.Row) -> dict[str, Any]:
+    """Fila de `claims` con sus columnas JSON ya decodificadas."""
+    item = dict(row)
+    item["attrs"] = json.loads(item.pop("attrs_json"))
+    for name in (*KNOWLEDGE_FIELDS, "tags"):
+        item[name] = json.loads(item.pop(f"{name}_json"))
+    return item
 
 
 class Store:
@@ -236,8 +283,46 @@ class Store:
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         for step in range(version or SCHEMA_VERSION, SCHEMA_VERSION):
             # Cada paso va en su transacción: si falla, la base queda en la versión anterior.
+            if step == 3:
+                self._migrate_claims_v4()
+                continue
             self.db.executescript(
                 f"BEGIN;\n{_MIGRATIONS[step]}\nPRAGMA user_version = {step + 1};\nCOMMIT;")
+
+    def _migrate_claims_v4(self) -> None:
+        """v3 -> v4: tipos nuevos y campos de conocimiento en `claims`, relaciones entre afirmaciones.
+
+        Cambiar la lista de tipos permitidos exige reconstruir la tabla. Antes se deja una
+        copia de seguridad junto a la base, por si algo fallara.
+        """
+        if self.path != ":memory:":
+            backup = sqlite3.connect(f"{self.path}.v3.bak")
+            with backup:
+                self.db.backup(backup)
+            backup.close()
+        self.db.commit()
+        self.db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.db.executescript(f"""BEGIN;
+                DROP TABLE claims_fts;
+                {CLAIMS_TABLE_DDL.replace("CREATE TABLE claims (", "CREATE TABLE claims_new (")}
+                INSERT INTO claims_new ({_CLAIM_COLUMNS_V3}) SELECT {_CLAIM_COLUMNS_V3} FROM claims;
+                DROP TABLE claims;
+                ALTER TABLE claims_new RENAME TO claims;
+                {CLAIMS_EXTRAS_DDL}
+                INSERT INTO claims_fts(claims_fts) VALUES ('rebuild');
+                ALTER TABLE implications ADD COLUMN conditional_on TEXT;
+                {RELATIONS_DDL}
+                PRAGMA user_version = 4;
+                COMMIT;""")
+        except BaseException:
+            self.db.rollback()
+            raise
+        finally:
+            self.db.execute("PRAGMA foreign_keys = ON")
+        broken = self.db.execute("PRAGMA foreign_key_check").fetchall()
+        if broken:
+            raise RuntimeError("La migración a v4 ha dejado referencias rotas; restaura la copia .v3.bak.")
 
     def close(self) -> None:
         self.db.close()
@@ -487,15 +572,18 @@ class Store:
                     statement, evidence_grade, stance, metric_name, metric_value, metric_unit,
                     metric_period, currency, as_of, valid_from, valid_to, horizon, ts_start,
                     ts_end, quote, confidence, attrs_json, status, published_at, captured_at,
-                    expires_at, fingerprint)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    expires_at, fingerprint, title, mechanism_json, applies_when_json,
+                    fails_when_json, tags_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (claim.source_id, claim.transcript_id, claim.run_id, claim.entity_id, claim.type,
                  claim.domain, claim.statement.strip(), claim.evidence_grade, claim.stance,
                  claim.metric_name, claim.metric_value, claim.metric_unit, claim.metric_period,
                  claim.currency, claim.as_of, claim.valid_from, claim.valid_to, claim.horizon,
                  claim.ts_start, claim.ts_end, claim.quote, claim.confidence,
                  json.dumps(claim.attrs, ensure_ascii=False), claim.status, published, captured,
-                 expires, fingerprint))
+                 expires, fingerprint, claim.title,
+                 *(json.dumps(getattr(claim, name), ensure_ascii=False)
+                   for name in (*KNOWLEDGE_FIELDS, "tags"))))
         return cur.lastrowid, True
 
     def set_claim_status(self, claim_id: int, status: str) -> None:
@@ -530,24 +618,49 @@ class Store:
         if status:
             sql += " AND c.status = ?"
             params.append(status)
-        out = []
-        for row in self.db.execute(sql + " ORDER BY c.ts_start IS NULL, c.ts_start, c.id", params):
-            item = dict(row)
-            item["attrs"] = json.loads(item.pop("attrs_json"))
-            out.append(item)
-        return out
+        return [_claim(row) for row in self.db.execute(
+            sql + " ORDER BY c.ts_start IS NULL, c.ts_start, c.id", params)]
 
     def add_implication(self, implication: Implication) -> int:
         implication.validate()
         with self.db:
             cur = self.db.execute(
                 """INSERT INTO implications (claim_id, target_entity_id, target_label, direction,
-                    mechanism, horizon, strength, confidence, basis, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    mechanism, horizon, strength, confidence, basis, created_at, conditional_on)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (implication.claim_id, implication.target_entity_id, implication.target_label,
                  implication.direction, implication.mechanism, implication.horizon,
-                 implication.strength, implication.confidence, implication.basis, utc_now()))
+                 implication.strength, implication.confidence, implication.basis, utc_now(),
+                 implication.conditional_on))
         return cur.lastrowid
+
+    def add_relation(self, from_claim_id: int, relation: str, to_claim_id: int,
+                     basis: str = "inferred_by_system") -> bool:
+        """Relaciona dos afirmaciones (apoya, contradice, matiza…). False si ya existía."""
+        if relation not in RELATION_TYPES:
+            raise ValidationError(f"relation no válida: {relation!r}")
+        if basis not in IMPLICATION_BASES:
+            raise ValidationError(f"basis no válido: {basis!r}")
+        if from_claim_id == to_claim_id:
+            raise ValidationError("una afirmación no puede relacionarse consigo misma")
+        with self.db:
+            cur = self.db.execute(
+                """INSERT OR IGNORE INTO claim_relations (from_claim_id, relation, to_claim_id, basis,
+                    created_at) VALUES (?,?,?,?,?)""",
+                (from_claim_id, relation, to_claim_id, basis, utc_now()))
+        return cur.rowcount > 0
+
+    def relations_for(self, claim_id: int) -> list[dict[str, Any]]:
+        """Relaciones en las que participa la afirmación, con el enunciado de la otra."""
+        return [dict(r) for r in self.db.execute(
+            """SELECT r.id, r.relation, r.basis, r.from_claim_id, r.to_claim_id,
+                      CASE WHEN r.from_claim_id = ? THEN 'out' ELSE 'in' END AS direction,
+                      c.id AS other_id, c.statement AS other_statement, c.status AS other_status
+               FROM claim_relations r
+               JOIN claims c ON c.id = CASE WHEN r.from_claim_id = ? THEN r.to_claim_id
+                                            ELSE r.from_claim_id END
+               WHERE r.from_claim_id = ? OR r.to_claim_id = ? ORDER BY r.id""",
+            (claim_id, claim_id, claim_id, claim_id))]
 
     # -- cola de trabajos ------------------------------------------------------
 
@@ -688,12 +801,7 @@ class Store:
             params.append(now)
         sql += "WHERE " + " AND ".join(where) + f" {order} LIMIT ?"
         params.append(int(limit))
-        out = []
-        for row in self.db.execute(sql, params):
-            item = dict(row)
-            item["attrs"] = json.loads(item.pop("attrs_json"))
-            out.append(item)
-        return out
+        return [_claim(row) for row in self.db.execute(sql, params)]
 
     def implications_for(self, claim_id: int) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute(
