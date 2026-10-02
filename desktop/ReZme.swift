@@ -35,7 +35,16 @@ enum KeyStore {
     static func delete() { SecItemDelete(query as CFDictionary) }
 }
 
-enum Pane: Hashable { case queue, library, contrast, cleanup, report, settings }
+enum Pane: Hashable { case queue, library, contrast, cleanup, agents, report, settings }
+
+/// Uso que un agente ha anotado: qué afirmaciones empleó y para qué.
+struct AgentUse: Identifiable {
+    let id: Int
+    let at: String
+    let agent: String
+    let purpose: String
+    let claims: Int
+}
 
 /// Dos afirmaciones de canales distintos y cómo se relacionan.
 struct CrossPair: Identifiable {
@@ -168,6 +177,14 @@ final class AppModel: ObservableObject {
     @Published var stats: [String: Int] = [:]
     @Published var query = ""
     @Published var hits: [ClaimHit]? = nil
+    // Agentes
+    @Published var agentConfig = ""
+    @Published var agentTools: [String] = []
+    @Published var agentUses: [AgentUse] = []
+    @Published var agentQuestion = ""
+    @Published var agentAnswer = ""
+    @Published var agentAnswerNote = ""
+
     // Contraste entre vídeos
     @Published var crossStats: [String: Int] = [:]
     @Published var crossPairs: [CrossPair] = []
@@ -557,6 +574,45 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Agentes
+
+    /// `status` trae la configuración para conectar agentes y lo que han usado; `ask` muestra qué
+    /// recibiría un agente para una pregunta. No llama a ningún modelo: solo lee la base.
+    func agents(_ action: String) {
+        var payload = ["mode": "agents", "action": action, "db": database.path, "root": root.path]
+        if action == "ask" {
+            payload["question"] = agentQuestion
+            payload["known_at"] = knownAt.trimmingCharacters(in: .whitespaces)
+            agentAnswerNote = "Buscando…"
+        }
+        launch(payload, owner: nil, onEvent: { event in
+            switch event["type"] as? String {
+            case "agents":
+                self.agentConfig = event["config"] as? String ?? ""
+                self.agentTools = (event["tools"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
+                self.agentUses = (event["uses"] as? [[String: Any]] ?? []).compactMap { item in
+                    guard let id = item["id"] as? Int else { return nil }
+                    return AgentUse(id: id, at: item["at"] as? String ?? "", agent: item["agent"] as? String ?? "",
+                                    purpose: item["purpose"] as? String ?? "", claims: item["claims"] as? Int ?? 0)
+                }
+            case "agents_answer":
+                self.agentAnswer = event["text"] as? String ?? ""
+                let omitted = event["omitted"] as? Int ?? 0
+                self.agentAnswerNote = "\(event["claims"] as? Int ?? 0) afirmaciones · unos \(event["tokens"] as? Int ?? 0) tokens"
+                    + (omitted > 0 ? " · \(omitted) más no caben" : "")
+            case "error":
+                self.agentAnswerNote = ""
+                self.fail(event["message"] as? String ?? "No se pudo consultar la base.")
+            default: break
+            }
+        })
+    }
+    func copyAgentConfig() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(agentConfig, forType: .string)
+        status = "Configuración copiada. Pégala en la configuración de servidores MCP de tu agente."; error = false
+    }
+
     // MARK: Contraste entre vídeos
 
     /// `run` cruza con el modelo las afirmaciones de las entidades que comparten varios canales.
@@ -761,6 +817,7 @@ struct ContentView: View {
                     case .queue: queuePane
                     case .library: libraryPane
                     case .report: reportPane
+                    case .agents: agentsPane
                     case .contrast: contrastPane
                     case .cleanup: cleanupPane
                     case .settings: settingsPane
@@ -790,6 +847,7 @@ struct ContentView: View {
             navItem(.library, "Base de conocimiento", "cylinder.split.1x2", badge: 0)
             navItem(.contrast, "Contraste", "arrow.left.arrow.right", badge: 0)
             navItem(.cleanup, "Limpieza", "wand.and.stars", badge: app.proposals.count)
+            navItem(.agents, "Agentes", "cpu", badge: 0)
             navItem(.report, "Informe rápido", "doc.text", badge: 0)
             Spacer()
             navItem(.settings, "Ajustes", "gearshape", badge: 0)
@@ -808,6 +866,7 @@ struct ContentView: View {
             if pane == .settings { app.loadKey() }
             if pane == .cleanup && app.busy == nil { app.catalog("status") }
             if pane == .contrast && app.busy != .contrast { app.cross("status") }
+            if pane == .agents { app.agents("status") }
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon).frame(width: 20)
@@ -1248,6 +1307,48 @@ struct ContentView: View {
         }
     }
 
+    // MARK: Agentes
+
+    var agentsPane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                header("Agentes", "Cómo consultan la base tus agentes. Solo pueden leer; lo único que escriben es el registro de qué han usado.")
+                    .padding(.bottom, -6)
+                setting("Conectar un agente", "Pega este bloque en la configuración de servidores MCP de tu agente (Claude Desktop, Claude Code u otro cliente MCP). El agente tendrá estas herramientas: \(app.agentTools.joined(separator: ", ")).") {
+                    Text(app.agentConfig.isEmpty ? "…" : app.agentConfig).font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled).padding(9).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                    Button(action: app.copyAgentConfig) { Label("Copiar configuración", systemImage: "doc.on.doc") }
+                        .disabled(app.agentConfig.isEmpty)
+                }
+                setting("Probar una pregunta", "Muestra exactamente lo que recibiría un agente: las afirmaciones más relevantes, con su por qué, sus límites y las que las contradicen. No llama a ningún modelo ni gasta nada.") {
+                    HStack {
+                        TextField("¿Puede AST SpaceMobile dar banda ancha a móviles normales?", text: $app.agentQuestion)
+                            .textFieldStyle(.roundedBorder).onSubmit { app.agents("ask") }
+                        Button("Probar") { app.agents("ask") }
+                            .disabled(app.agentQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if !app.agentAnswerNote.isEmpty { Text(app.agentAnswerNote).font(.caption).foregroundStyle(accent) }
+                    if !app.agentAnswer.isEmpty {
+                        ScrollView {
+                            Text(app.agentAnswer).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading).padding(9)
+                        }.frame(height: 230).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                setting("Registro de uso", app.agentUses.isEmpty ? "Aquí aparecerá cada decisión que un agente apoye en la base, con las afirmaciones que citó."
+                                                                 : "Lo que los agentes han anotado, lo más reciente primero.") {
+                    ForEach(app.agentUses.prefix(40)) { use in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(use.purpose).font(.callout).fixedSize(horizontal: false, vertical: true)
+                            Text("\(use.at) · \(use.agent) · \(use.claims) afirmaciones").font(.caption).foregroundStyle(.secondary)
+                        }.padding(.vertical, 3)
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: Contraste
 
     func pairSide(_ text: String, _ origin: String) -> some View {
@@ -1417,7 +1518,7 @@ struct ContentView: View {
             content()
             Text(note).font(.caption).foregroundStyle(.secondary)
         }
-        .padding(14).frame(maxWidth: 560, alignment: .leading)
+        .padding(14).frame(maxWidth: 720, alignment: .leading)
         .background(panel, in: RoundedRectangle(cornerRadius: 12))
     }
 

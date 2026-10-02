@@ -526,6 +526,29 @@ class DesktopTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AAAA-MM-DD"):
                 hits(known_at="ayer")
 
+    def test_agents_pane_shows_config_answer_and_usage(self):
+        import os, tempfile
+        from rezme import Claim, Store, agents
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "rezme.db")
+            with Store(db) as store:
+                src, _ = store.add_source("youtube", "aaaaaaaaaa1", title="V", channel="Canal", published_at="2026-09-01")
+                claim, _ = store.add_claim(Claim(source_id=src, statement="El petróleo caro contagia la inflación.",
+                                                 type="mechanism", status="verified"))
+            status = self._run(worker.run_agents, dict(db=db, root="/proyecto"))[-1]
+            config = json.loads(status["config"])["mcpServers"]["rezme"]
+            self.assertEqual((config["args"], config["env"]), (["-m", "rezme", "mcp"], {"PYTHONPATH": "/proyecto", "REZME_DB": db}))
+            self.assertEqual((status["uses"], status["tools"][0]["name"]), ([], "contexto"))
+            answer = self._run(worker.run_agents, dict(db=db, action="ask", question="¿qué pasa con la inflación?"))[-1]
+            self.assertEqual((answer["type"], answer["claims"]), ("agents_answer", 1))
+            self.assertIn(f"#{claim} ", answer["text"])
+            with Store(db, readonly=True) as store:
+                agents.log_use(store, agents.usage_path(db), [claim], "Cubrir inflación", agent="a1")
+            use = self._run(worker.run_agents, dict(db=db))[-1]["uses"][0]
+            self.assertEqual((use["agent"], use["purpose"], use["claims"]), ("a1", "Cubrir inflación", 1))
+            with self.assertRaisesRegex(ValueError, "pregunta"):
+                self._run(worker.run_agents, dict(db=db, action="ask", question=" "))
+
     def _run(self, function, options):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

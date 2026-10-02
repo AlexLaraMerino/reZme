@@ -10,6 +10,7 @@
 - **Base de conocimiento:** los vídeos guardados, el botón para extraer sus afirmaciones con un modelo, los recuentos de la base y un buscador de afirmaciones verificadas.
 - **Contraste:** cruza lo que dicen los distintos canales sobre una misma entidad y muestra qué afirmaciones coinciden, cuáles se contradicen y cuáles se matizan. Cada afirmación indica cuántos canales independientes la sostienen o la contradicen; dos vídeos del mismo canal no cuentan como fuentes distintas. El buscador admite una fecha para ver solo lo que ya se sabía ese día.
 - **Limpieza:** propone fusionar las entidades que son la misma cosa con distinto nombre (en dos idiomas, con siglas, en plural) y retira afirmaciones repetidas. Nada se fusiona sin que lo apruebes, y antes se guarda una copia de la base.
+- **Agentes:** el bloque de configuración para conectar un agente a la base por MCP, un probador que muestra lo que recibiría para una pregunta y el registro de lo que los agentes han usado. Los agentes solo pueden leer.
 - **Informe rápido:** el esquema, la tesis y los highlights de un solo vídeo, con las dos opciones de abajo.
 - **Ajustes:** clave de Meta (se guarda en el Llavero de macOS), motor de extracción (Muse Spark o Claude Code), sesión de YouTube, Whisper y ubicación de la base.
 

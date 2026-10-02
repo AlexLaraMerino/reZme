@@ -309,3 +309,33 @@ de **fuentes distintas**.
   generales sin entidad (336 afirmaciones) no entran; necesitarían búsqueda
   semántica (M4).
 
+## 13. M4 · Interfaz para agentes
+
+- **Servidor MCP** (`python -m rezme mcp`, `rezme/mcp.py`): JSON-RPC por la
+  entrada y la salida estándar, solo con la biblioteca estándar. Herramientas:
+  `contexto`, `buscar`, `afirmacion`, `entidad`, `contradicciones`, `estado` y
+  `registrar_uso`. Un mal uso de una herramienta se devuelve como error al
+  agente, sin tirar el servidor.
+- **Solo lectura de verdad.** La base se abre con `Store(path, readonly=True)`
+  (`mode=ro` y `query_only`): ni siquiera se migra. El registro de uso va a otro
+  fichero, `rezme_uso.db`, así que la interfaz de agentes no puede alterar el
+  conocimiento.
+- **Búsqueda por relevancia** (`Store.search_ranked`): no exige todas las
+  palabras; combina texto (título, enunciado y cita, con prefijos), las
+  entidades que nombra la pregunta (por nombre o alias), la cobertura de la
+  pregunta, el respaldo de otros canales y el tipo de conocimiento. Sin
+  dependencias nuevas.
+- **Paquete de contexto** (`agents.context_pack`): lo más relevante dentro de un
+  límite de tokens, con el porqué y los límites de cada afirmación marcados como
+  [autor] o [modelo], y la afirmación que la contradice justo debajo.
+- **Datos, no instrucciones.** Todo paquete empieza con el aviso de que el
+  contenido son datos y de qué significa «verificada»; las instrucciones del
+  servidor lo repiten.
+- **Pendiente:** búsqueda semántica con embeddings. La búsqueda actual es
+  léxica: una pregunta en inglés casi no encuentra nada porque los enunciados
+  están en español, y los sinónimos que no comparten raíz se escapan. Requiere
+  elegir un proveedor de embeddings y dónde guardar los vectores.
+- Prueba sobre la base real con diez preguntas: nueve devuelven afirmaciones
+  pertinentes (con la contradicción a la vista cuando la hay); la décima,
+  «riesgos de Nvidia», devuelve afirmaciones sobre Nvidia pero no riesgos.
+

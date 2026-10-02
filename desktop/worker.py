@@ -651,6 +651,35 @@ def run_cross(options):
         emit_cross(store)
 
 
+def run_agents(options):
+    """Pantalla de agentes: cómo conectarlos, qué recibirían para una pregunta y qué han usado."""
+    from rezme import Store, agents, mcp
+
+    action = options.get("action", "status")
+    if action not in ("status", "ask"):
+        raise ValueError("Acción de agentes no válida.")
+    db = options.get("db")
+    if not db:
+        raise ValueError("No se encuentra la base de datos de reZme.")
+    if action == "ask":
+        question = str(options.get("question") or "").strip()
+        if not question:
+            raise ValueError("Escribe una pregunta.")
+        with Store(db, readonly=True) as store:
+            pack = agents.context_pack(store, question, max_tokens=int(_number(options, "max_tokens") or 1500),
+                                       a_fecha=options.get("known_at"))
+        emit("agents_answer", text=pack["texto"], claims=len(pack["ids"]), tokens=pack["tokens_estimados"],
+             omitted=pack["omitidas"])
+        return
+    root = options.get("root") or str(Path(__file__).resolve().parent.parent)
+    config = mcp.client_config(sys.executable, root, db)
+    uses = [{"id": use["id"], "at": use["at"].replace("T", " ").rstrip("Z"), "agent": use["agent"] or "agente",
+             "purpose": use["purpose"], "claims": len(use["claim_ids"]), "question": use["question"] or ""}
+            for use in agents.list_uses(agents.usage_path(db), 200)]
+    emit("agents", config=json.dumps(config, ensure_ascii=False, indent=2), uses=uses,
+         tools=[{"name": tool["name"], "description": tool["description"]} for tool in mcp.TOOLS])
+
+
 ENTITY_TYPE_LABELS = {
     "company": "empresa", "security": "valor", "crypto_asset": "criptoactivo", "commodity": "materia prima",
     "currency": "divisa", "index": "índice", "country": "país", "central_bank": "banco central",
@@ -740,6 +769,8 @@ if __name__ == "__main__":
             run_catalog(options)
         elif options.get("mode") == "cross":
             run_cross(options)
+        elif options.get("mode") == "agents":
+            run_agents(options)
         else:
             run(options)
     except Exception as error:
