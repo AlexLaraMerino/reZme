@@ -411,6 +411,69 @@ class DesktopTests(unittest.TestCase):
                 self.assertEqual(store.stats()["claims_by_status"], {"verified": 2})
                 self.assertTrue(store.get_run(1)["stats"]["tramos"]["0"]["truncada"])
 
+    def catalog(self, db, **options):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            worker.run_catalog(dict(mode="catalog", db=db, **options))
+        return [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_catalog_cleaning_from_the_app(self):
+        import os, tempfile
+        from rezme import Claim, Store
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "rezme.db")
+            with Store(db) as store:
+                src, _ = store.add_source("youtube", "aaaaaaaaaa1", title="V")
+                ids = {}
+                for type_, name, n in (("central_bank", "Reserva Federal", 2), ("central_bank", "Federal Reserve", 3),
+                                       ("technology", "virtual cell", 2), ("technology", "virtual cells", 1),
+                                       ("company", "Amazon", 1)):
+                    ids[name] = store.upsert_entity(type_, name)
+                    for i in range(n):
+                        store.add_claim(Claim(source_id=src, statement=f"{name} {i}", type="fact", status="verified",
+                                              entity_id=ids[name], quote=f"cita número {i} sobre {name} en el vídeo"))
+                store.add_claim(Claim(source_id=src, statement="Repetida.", type="fact", status="verified",
+                                      quote="cita número 0 sobre Amazon en el vídeo"))
+            empty = self.catalog(db, action="status")[-1]
+            self.assertEqual((empty["type"], empty["proposals"], empty["entities"], empty["duplicates"]), ("catalog", [], 5, 1))
+
+            answer = json.dumps({"groups": [{"ids": [ids["Reserva Federal"], ids["Federal Reserve"]], "reason": "mismo banco"}]})
+            with patch.object(worker, "call_meta_extract", return_value=answer) as call:
+                events = self.catalog(db, action="propose", use_model="1", engine="meta", key="secret-test", model="m",
+                                      price_in="1", price_out="1", budget="5")
+            self.assertTrue(call.called)
+            self.assertIn("exactamente la misma cosa", call.call_args.args[0])
+            self.assertNotIn("secret-test", json.dumps(events))
+            listing = [e for e in events if e["type"] == "catalog"][-1]["proposals"]
+            got = {(p["drop"]["name"], p["keep"]["name"], p["origin"], p["keep"]["type"]) for p in listing}
+            self.assertEqual(got, {("virtual cells", "virtual cell", "rule", "tecnología"),
+                                   ("Reserva Federal", "Federal Reserve", "model", "banco central")})
+            self.assertIn("2 propuestas nuevas (1 por coincidencia de nombre, 1 sugeridas por el modelo", events[-1]["message"])
+
+            rule = next(p["id"] for p in listing if p["origin"] == "rule")
+            model = next(p["id"] for p in listing if p["origin"] == "model")
+            after = self.catalog(db, action="dismiss", ids=str(rule))[-1]
+            self.assertEqual([p["id"] for p in after["proposals"]], [model])
+            with self.assertRaisesRegex(ValueError, "seleccionada"):
+                self.catalog(db, action="apply", ids="")
+            events = self.catalog(db, action="apply", ids=str(model))
+            self.assertIn("1 entidades fusionadas · 2 afirmaciones reasignadas", events[-1]["message"])
+            self.assertEqual((events[-2]["entities"], events[-2]["merged"], events[-2]["proposals"]), (4, 1, []))
+            merge = events[-2]["merges"][0]
+            self.assertEqual((merge["drop"], merge["keep"], merge["claims"], merge["undoable"]),
+                             ("Reserva Federal", "Federal Reserve", 2, True))
+            undone = self.catalog(db, action="undo", ids=str(merge["id"]))
+            self.assertIn("Fusión deshecha: 2 afirmaciones", undone[-1]["message"])
+            self.assertEqual((undone[-2]["entities"], undone[-2]["merges"], undone[-2]["proposals"]), (5, [], []))
+            with Store(db) as store:
+                store.merge_entities(ids["Federal Reserve"], store.resolve_entity("Reserva Federal"))
+            self.assertTrue(os.path.exists(db + ".antes-de-fusionar.bak"))
+            events = self.catalog(db, action="dedupe")
+            self.assertIn("1 afirmaciones repetidas retiradas", events[-1]["message"])
+            self.assertEqual(events[-2]["duplicates"], 0)
+            with self.assertRaises(ValueError):
+                self.catalog(db, action="borrar-todo")
+
     def test_queue_status_empty_and_bad_input(self):
         import os, tempfile
         with tempfile.TemporaryDirectory() as tmp:

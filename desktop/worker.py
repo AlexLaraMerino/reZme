@@ -591,6 +591,78 @@ def run_library(options):
             } for row in rows])
 
 
+ENTITY_TYPE_LABELS = {
+    "company": "empresa", "security": "valor", "crypto_asset": "criptoactivo", "commodity": "materia prima",
+    "currency": "divisa", "index": "índice", "country": "país", "central_bank": "banco central",
+    "macro_indicator": "indicador macro", "sector": "sector", "technology": "tecnología", "drug": "fármaco",
+    "disease": "enfermedad", "biological_concept": "concepto biológico", "person": "persona",
+    "organization": "organización", "regulation": "regulación", "event": "evento", "concept": "concepto"}
+
+
+def emit_catalog(store):
+    from rezme import catalog
+    side = lambda p, which: {"name": p[f"{which}_name"], "type": ENTITY_TYPE_LABELS.get(p[f"{which}_type"], p[f"{which}_type"]),
+                             "claims": p[f"{which}_claims"]}
+    proposals = [{"id": p["id"], "origin": p["origin"], "reason": p["reason"] or "",
+                  "same_type": p["into_type"] == p["from_type"],
+                  "keep": side(p, "into"), "drop": side(p, "from")} for p in store.merge_proposals()]
+    stats = store.stats()
+    merges = [{"id": m["id"], "drop": m["from_name"], "keep": m["into_name"], "claims": m["claims_moved"],
+               "undoable": bool(m["undoable"])} for m in store.entity_merges()[:300]]
+    emit("catalog", proposals=proposals, entities=stats["entities"], merged=stats["entity_merges"],
+         duplicates=len(catalog.duplicate_claims(store)), merges=merges)
+
+
+def run_catalog(options):
+    """Limpieza del catálogo desde la app: proponer, aplicar o descartar fusiones y quitar repetidas."""
+    from rezme import Store, catalog
+
+    action = options.get("action", "status")
+    if action not in ("status", "propose", "apply", "dismiss", "dedupe", "undo"):
+        raise ValueError("Acción de limpieza no válida.")
+    if not options.get("db"):
+        raise ValueError("No se encuentra la base de datos de reZme.")
+    ids = [int(part) for part in str(options.get("ids") or "").split(",") if part.strip().isdigit()]
+    with Store(options["db"]) as store:
+        if action == "propose":
+            emit("progress", message="Buscando coincidencias evidentes…")
+            call = None
+            if options.get("use_model"):
+                backend, spent, _ = extraction_backend(options)
+                call = backend.call
+            found = catalog.propose_merges(store, call, lambda message: emit("progress", message=message))
+            message = f"{found['rule'] + found['model']} propuestas nuevas ({found['rule']} por coincidencia de nombre"
+            message += f", {found['model']} sugeridas por el modelo · gasto {spent['cost']:.3f} $)" if call else ")"
+            emit_catalog(store)
+            emit("done", message=message + ". Revísalas antes de fusionar.")
+            return
+        if action == "apply":
+            if not ids:
+                raise ValueError("No hay ninguna fusión seleccionada.")
+            store.backup("antes-de-fusionar")
+            done = catalog.apply_merges(store, ids)
+            emit_catalog(store)
+            emit("done", message=f"{done['entidades']} entidades fusionadas · {done['afirmaciones']} afirmaciones reasignadas. "
+                                 "Hay una copia de la base anterior junto al fichero.")
+            return
+        if action == "undo":
+            if not ids:
+                raise ValueError("No hay ninguna fusión seleccionada.")
+            moved = sum(store.undo_merge(merge_id) for merge_id in ids)
+            emit_catalog(store)
+            emit("done", message=f"Fusión deshecha: {moved} afirmaciones vuelven a su entidad. No volverá a proponerse.")
+            return
+        if action == "dismiss":
+            store.dismiss_merge_proposals(ids)
+        elif action == "dedupe":
+            store.backup("antes-de-fusionar")
+            removed = catalog.remove_duplicate_claims(store)
+            emit_catalog(store)
+            emit("done", message=f"{removed} afirmaciones repetidas retiradas (se conserva la más completa de cada par).")
+            return
+        emit_catalog(store)
+
+
 def _terminate(*_):
     raise KeyboardInterrupt  # Cancelar desde la app: la cola deja el vídeo en curso limpio.
 
@@ -604,6 +676,8 @@ if __name__ == "__main__":
             run_queue(options)
         elif options.get("mode") == "library":
             run_library(options)
+        elif options.get("mode") == "catalog":
+            run_catalog(options)
         else:
             run(options)
     except Exception as error:

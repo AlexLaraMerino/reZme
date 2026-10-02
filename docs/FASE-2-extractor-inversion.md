@@ -250,3 +250,35 @@ entidades, implicaciones inferidas aceptadas, coste por hora de vídeo.
   la base siguen siendo secuenciales y en orden. El tope de gasto puede
   superarse en tantas llamadas como tramos haya en curso.
 
+## 11. M2 · Limpieza del catálogo (esquema v5)
+
+Con los 78 vídeos extraídos (4.658 afirmaciones verificadas) había 981 entidades,
+casi la mitad con una sola afirmación, y la misma cosa con varios nombres
+(«Federal Reserve» y «Reserva Federal», «Oil» y «Petróleo»).
+
+- **Propuestas de fusión** (`merge_proposals`), nunca fusiones automáticas. Dos
+  orígenes: reglas (mismo nombre salvo sufijos societarios o plural, mismo
+  ticker, nombre que ya es alias de otra; solo dentro del mismo tipo) y modelo
+  (traducciones y siglas, por lotes de tipos afines; solo se aceptan ids de la
+  lista enviada). Se queda la entidad más usada.
+- **Fusión** (`Store.merge_entities`): las afirmaciones e implicaciones pasan a
+  la entidad que queda, el nombre absorbido se conserva como alias (las
+  siguientes extracciones ya lo reconocen) y queda registro en `entity_merges`.
+  Antes de aplicar se guarda `rezme.db.antes-de-fusionar.bak`.
+- Las propuestas descartadas no vuelven a proponerse.
+- **Afirmaciones repetidas**: misma cita y misma cifra en el mismo vídeo (solape
+  entre tramos). Se conserva la más completa; la otra pasa a `rejected` con
+  `attrs.duplicado_de`, y sus relaciones pasan a la que queda.
+- **Deshacer** (esquema v6): cada fusión guarda qué afirmaciones, implicaciones
+  y alias movió (`entity_merges.moved_json`), y `Store.undo_merge` recrea la
+  entidad absorbida y se lo devuelve. La pareja queda descartada como propuesta.
+  Las fusiones anteriores a v6 no guardaron ese detalle y no se pueden deshacer.
+- **Cifras normalizadas** (esquema v6, `rezme/units.py`): `metric_value` y
+  `metric_unit` conservan lo que se dijo; `metric_value_abs` y
+  `metric_unit_base` añaden el valor absoluto y la unidad canónica («45 miles de
+  millones USD» → 4,5e10 USD; «17 GW» → 1,7e10 W). Es determinista y lo ambiguo
+  («trillones») se deja sin normalizar. En la base real: 1.165 de 1.167 cifras.
+- El glosario de errores de transcripción no se ha hecho como pieza aparte: las
+  fusiones propuestas por el modelo ya corrigen nombres mal transcritos
+  («Kevin Wors» → «Kevin Warsh») y los dejan como alias.
+

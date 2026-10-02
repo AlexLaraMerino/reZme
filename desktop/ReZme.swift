@@ -35,7 +35,21 @@ enum KeyStore {
     static func delete() { SecItemDelete(query as CFDictionary) }
 }
 
-enum Pane: Hashable { case queue, library, report, settings }
+enum Pane: Hashable { case queue, library, cleanup, report, settings }
+
+/// Propuesta de fusionar una entidad (`drop`) dentro de otra (`keep`).
+struct MergeProposal: Identifiable {
+    let id: Int
+    let origin: String
+    let reason: String
+    let sameType: Bool
+    let keepName: String
+    let keepType: String
+    let keepClaims: Int
+    let dropName: String
+    let dropType: String
+    let dropClaims: Int
+}
 
 struct QueueJob: Identifiable {
     let id: Int
@@ -100,6 +114,15 @@ struct ClaimHit: Identifiable {
     let meta: String
 }
 
+/// Fusión ya aplicada, por si hay que deshacerla.
+struct DoneMerge: Identifiable {
+    let id: Int
+    let drop: String
+    let keep: String
+    let claims: Int
+    let undoable: Bool
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     private let defaults = UserDefaults.standard
@@ -121,6 +144,18 @@ final class AppModel: ObservableObject {
     @Published var stats: [String: Int] = [:]
     @Published var query = ""
     @Published var hits: [ClaimHit]? = nil
+    // Limpieza del catálogo
+    @Published var proposals: [MergeProposal] = []
+    @Published var catalogStats: [String: Int] = [:]
+    @Published var doneMerges: [DoneMerge] = []
+    @Published var showDoneMerges = false
+    /// Propuestas que no se fusionarán: las desmarcadas a mano y, de entrada, las de tipos distintos.
+    @Published var unchecked: Set<Int> = []
+    @Published var useModelForCleanup = true
+    @Published var confirmMerge = false
+    private var knownProposals: Set<Int> = []
+    var chosenProposals: [MergeProposal] { proposals.filter { !unchecked.contains($0.id) } }
+
     /// Vídeo abierto en detalle, con sus afirmaciones.
     @Published var detail: SourceDetail? = nil
 
@@ -214,6 +249,12 @@ final class AppModel: ObservableObject {
         text += "La extracción se detendrá sola al llegar a \(money(budgetValue)). "
         text += engine == "meta" ? "El consumo se factura en tu cuenta de Meta." : "Se usa tu suscripción de Claude Code."
         text += " Puedes pausar cuando quieras: continuará donde lo dejó."
+        return text
+    }
+    func proposalDetail(_ proposal: MergeProposal) -> String {
+        var text = "\(proposal.dropType), \(proposal.dropClaims) afirmaciones"
+        text += " → \(proposal.keepType), \(proposal.keepClaims) afirmaciones"
+        if !proposal.reason.isEmpty { text += " · " + proposal.reason }
         return text
     }
     /// Etiqueta de la fila de un vídeo: coste estimado si falta extraer, o sus afirmaciones.
@@ -468,6 +509,73 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Limpieza del catálogo
+
+    /// `propose` busca duplicados, `apply` fusiona las elegidas, `dismiss` las descarta y `dedupe`
+    /// retira afirmaciones repetidas. Ninguna fusión se aplica sin pasar por `apply`.
+    func undoMerge(_ merge: DoneMerge) { catalog("undo", ids: String(merge.id)) }
+
+    func catalog(_ action: String, ids: String? = nil) {
+        let tracked = action == "propose" || action == "apply" || action == "dedupe" || action == "undo"
+        if tracked {
+            guard busy == nil else { status = "Hay una tarea en curso. Espera a que termine o páusala."; error = true; return }
+            error = false
+        }
+        var payload = ["mode": "catalog", "action": action, "db": database.path]
+        if action == "apply" || action == "dismiss" {
+            payload["ids"] = chosenProposals.map { String($0.id) }.joined(separator: ",")
+        }
+        if let ids { payload["ids"] = ids }
+        if action == "propose" && useModelForCleanup {
+            if engine == "meta" {
+                loadKey()
+                if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    pane = .settings; fail("Introduce tu clave de Meta en los ajustes, o desmarca el uso del modelo."); return
+                }
+            }
+            payload["use_model"] = "1"
+            payload["engine"] = engine
+            payload["key"] = engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            payload["model"] = model
+            payload["budget"] = String(budgetValue)
+            payload["price_in"] = String(number(priceIn))
+            payload["price_out"] = String(number(priceOut))
+            payload["reasoning"] = reasoning
+        }
+        let started = launch(payload, owner: tracked ? .cleanup : nil, onEvent: { event in
+            switch event["type"] as? String {
+            case "progress", "done": self.status = event["message"] as? String ?? ""
+            case "error": self.fail(event["message"] as? String ?? "No se pudo completar la limpieza.")
+            case "catalog":
+                self.catalogStats = ["entities": event["entities"] as? Int ?? 0, "merged": event["merged"] as? Int ?? 0,
+                                     "duplicates": event["duplicates"] as? Int ?? 0]
+                let items: [MergeProposal] = (event["proposals"] as? [[String: Any]] ?? []).compactMap { item in
+                    guard let id = item["id"] as? Int, let keep = item["keep"] as? [String: Any],
+                          let drop = item["drop"] as? [String: Any] else { return nil }
+                    return MergeProposal(id: id, origin: item["origin"] as? String ?? "", reason: item["reason"] as? String ?? "",
+                                         sameType: item["same_type"] as? Bool ?? true,
+                                         keepName: keep["name"] as? String ?? "", keepType: keep["type"] as? String ?? "",
+                                         keepClaims: keep["claims"] as? Int ?? 0, dropName: drop["name"] as? String ?? "",
+                                         dropType: drop["type"] as? String ?? "", dropClaims: drop["claims"] as? Int ?? 0)
+                }
+                // Las de tipos distintos son las más dudosas: llegan desmarcadas.
+                for item in items where !self.knownProposals.contains(item.id) && !item.sameType { self.unchecked.insert(item.id) }
+                self.knownProposals.formUnion(items.map { $0.id })
+                self.proposals = items
+                self.doneMerges = (event["merges"] as? [[String: Any]] ?? []).compactMap { item in
+                    guard let id = item["id"] as? Int else { return nil }
+                    return DoneMerge(id: id, drop: item["drop"] as? String ?? "", keep: item["keep"] as? String ?? "",
+                                     claims: item["claims"] as? Int ?? 0, undoable: item["undoable"] as? Bool ?? false)
+                }
+            default: break
+            }
+        }, onExit: { ok in
+            if tracked && !ok && !self.error { self.fail("La limpieza se ha interrumpido. Puedes volver a lanzarla.") }
+            if tracked { self.loadLibrary() }
+        })
+        if started && action == "propose" { status = "Buscando entidades duplicadas…" }
+    }
+
     // MARK: Informe rápido
 
     func start() {
@@ -557,6 +665,7 @@ struct ContentView: View {
                     case .queue: queuePane
                     case .library: libraryPane
                     case .report: reportPane
+                    case .cleanup: cleanupPane
                     case .settings: settingsPane
                     }
                 }
@@ -566,7 +675,7 @@ struct ContentView: View {
             }.background(Color(nsColor: .textBackgroundColor))
         }
         .frame(minWidth: 980, minHeight: 700)
-        .onAppear { app.queue("status"); app.loadLibrary() }
+        .onAppear { app.queue("status"); app.loadLibrary(); app.catalog("status") }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in app.cancel() }
     }
 
@@ -582,6 +691,7 @@ struct ContentView: View {
                 .padding(.bottom, 18)
             navItem(.queue, "Cola", "tray.and.arrow.down", badge: app.waiting)
             navItem(.library, "Base de conocimiento", "cylinder.split.1x2", badge: 0)
+            navItem(.cleanup, "Limpieza", "wand.and.stars", badge: app.proposals.count)
             navItem(.report, "Informe rápido", "doc.text", badge: 0)
             Spacer()
             navItem(.settings, "Ajustes", "gearshape", badge: 0)
@@ -598,6 +708,7 @@ struct ContentView: View {
             if pane == .library { if app.pane == .library { app.detail = nil }; app.loadLibrary(search: !app.query.isEmpty) }
             if pane == .queue && app.busy == nil { app.queue("status") }
             if pane == .settings { app.loadKey() }
+            if pane == .cleanup && app.busy == nil { app.catalog("status") }
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon).frame(width: 20)
@@ -1009,6 +1120,105 @@ struct ContentView: View {
                 TextEditor(text: $app.output).font(.system(size: 13, design: .monospaced)).lineSpacing(4)
                     .scrollContentBackground(.hidden)
             }
+        }
+    }
+
+    // MARK: Limpieza
+
+    var cleanupPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header("Limpieza", "Entidades con varios nombres y afirmaciones repetidas. Nada se fusiona sin que lo apruebes.")
+            HStack(spacing: 10) {
+                tile(app.catalogStats["entities"] ?? 0, "Entidades")
+                tile(app.proposals.count, "Fusiones propuestas", accent)
+                tile(app.catalogStats["merged"] ?? 0, "Ya fusionadas", accent)
+                tile(app.catalogStats["duplicates"] ?? 0, "Afirmaciones repetidas", .orange)
+            }.padding(.bottom, 14)
+            HStack(spacing: 12) {
+                Image(systemName: "wand.and.stars").font(.title3).foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("La misma cosa suele acabar con varios nombres: en dos idiomas, con siglas o en plural.")
+                        .font(.system(size: 13, weight: .semibold))
+                    Toggle("Usar el modelo (\(app.engineName)) para equivalencias que no se ven en el nombre: traducciones y siglas. Son unas cuatro llamadas.",
+                           isOn: $app.useModelForCleanup).toggleStyle(.checkbox).font(.caption).disabled(app.busy != nil)
+                }
+                Spacer()
+                if app.busy == .cleanup { ProgressView().controlSize(.small) }
+                if (app.catalogStats["duplicates"] ?? 0) > 0 {
+                    Button("Quitar repetidas") { app.catalog("dedupe") }.disabled(app.busy != nil)
+                        .help("Retira las afirmaciones del mismo vídeo con la misma cita, conservando la más completa.")
+                }
+                Button { app.catalog("propose") } label: { Label("Buscar duplicados", systemImage: "magnifyingglass").padding(.horizontal, 4) }
+                    .buttonStyle(.borderedProminent).tint(accent).disabled(app.busy != nil)
+            }
+            .padding(13).background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            .padding(.bottom, 14)
+
+            if !app.doneMerges.isEmpty {
+                DisclosureGroup("Fusiones hechas (\(app.doneMerges.count))", isExpanded: $app.showDoneMerges) {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(app.doneMerges) { merge in
+                                HStack(spacing: 6) {
+                                    Text(merge.drop).foregroundStyle(.secondary)
+                                    Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
+                                    Text(merge.keep)
+                                    Text("· \(merge.claims) afirmaciones").font(.caption).foregroundStyle(.secondary)
+                                    Spacer()
+                                    Button("Deshacer") { app.undoMerge(merge) }.controlSize(.small).disabled(!merge.undoable || app.busy != nil)
+                                        .help(merge.undoable ? "Recrea la entidad absorbida y le devuelve sus afirmaciones." : "Fusión anterior a esta versión: no se guardó qué se movió.")
+                                }.font(.callout).lineLimit(1).padding(.vertical, 4)
+                            }
+                        }
+                    }.frame(maxHeight: 190)
+                }.font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.bottom, 12)
+            }
+            if app.proposals.isEmpty {
+                emptyState("checkmark.seal", "No hay fusiones pendientes", "Pulsa «Buscar duplicados» para revisar el catálogo.\nVerás cada propuesta antes de aplicarla.")
+            } else {
+                HStack {
+                    Text("FUSIONES PROPUESTAS · \(app.chosenProposals.count) de \(app.proposals.count) marcadas")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Todas") { app.unchecked = [] }
+                    Button("Ninguna") { app.unchecked = Set(app.proposals.map { $0.id }) }
+                    Button("Descartar marcadas") { app.catalog("dismiss") }.disabled(app.chosenProposals.isEmpty)
+                        .help("No volverán a proponerse.")
+                    Button { app.confirmMerge = true } label: { Label("Fusionar marcadas", systemImage: "arrow.triangle.merge") }
+                        .buttonStyle(.borderedProminent).tint(accent).disabled(app.chosenProposals.isEmpty)
+                }.controlSize(.small).disabled(app.busy != nil).padding(.bottom, 6)
+                rows(app.proposals) { proposal in
+                    HStack(alignment: .top, spacing: 10) {
+                        Button {
+                            if app.unchecked.contains(proposal.id) { app.unchecked.remove(proposal.id) } else { app.unchecked.insert(proposal.id) }
+                        } label: {
+                            Image(systemName: app.unchecked.contains(proposal.id) ? "square" : "checkmark.square.fill")
+                                .foregroundStyle(app.unchecked.contains(proposal.id) ? Color.secondary : accent)
+                        }.buttonStyle(.plain).disabled(app.busy != nil).padding(.top, 1)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(proposal.dropName).strikethrough(!app.unchecked.contains(proposal.id), color: .secondary)
+                                Image(systemName: "arrow.right").font(.caption).foregroundStyle(.secondary)
+                                Text(proposal.keepName).fontWeight(.semibold)
+                            }.lineLimit(1)
+                            Text(app.proposalDetail(proposal)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            if !proposal.sameType {
+                                Label("Son de tipos distintos: revísala con cuidado.", systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(Color.orange)
+                            }
+                        }
+                        Spacer()
+                        Text(proposal.origin == "model" ? "modelo" : "nombre").font(.caption).foregroundStyle(.secondary)
+                            .padding(.horizontal, 8).padding(.vertical, 3).background(panel, in: Capsule())
+                    }
+                }
+            }
+        }
+        .confirmationDialog("¿Fusionar \(app.chosenProposals.count) entidades?", isPresented: $app.confirmMerge) {
+            Button("Fusionar") { app.catalog("apply") }
+            Button("Cancelar", role: .cancel) {}
+        } message: {
+            Text("Las afirmaciones de cada entidad tachada pasarán a la que queda, y su nombre se conservará como alias. Antes se guarda una copia de la base junto al fichero.")
         }
     }
 

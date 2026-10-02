@@ -8,6 +8,7 @@
 
 - **Cola:** pega una lista de reproducción o varias URLs y reZme guarda la transcripción de cada vídeo, uno a uno. Se puede pausar y continuar.
 - **Base de conocimiento:** los vídeos guardados, el botón para extraer sus afirmaciones con un modelo, los recuentos de la base y un buscador de afirmaciones verificadas.
+- **Limpieza:** propone fusionar las entidades que son la misma cosa con distinto nombre (en dos idiomas, con siglas, en plural) y retira afirmaciones repetidas. Nada se fusiona sin que lo apruebes, y antes se guarda una copia de la base.
 - **Informe rápido:** el esquema, la tesis y los highlights de un solo vídeo, con las dos opciones de abajo.
 - **Ajustes:** clave de Meta (se guarda en el Llavero de macOS), motor de extracción (Muse Spark o Claude Code), sesión de YouTube, Whisper y ubicación de la base.
 
