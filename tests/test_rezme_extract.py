@@ -636,13 +636,18 @@ class ExtractTests(ExtractBase):
         calls.clear()
         self.store.save_transcript(self.src, self.long_transcript() + [(1300.0, "fin")], "whisper")
 
-        def denied(system, user):
-            calls.append(user)
-            raise bk.BackendUnavailable("La clave API no es válida.")
+        import time
+        for _ in range(20):  # el fallo es inmediato: sin freno, los hilos vaciarían la cola de tramos
+            attempts = []    # una lista por vuelta: un hilo rezagado de la anterior no la contamina
 
-        with self.assertRaises(bk.BackendUnavailable):
-            ex.extract_source(self.store, self.src, bk.Backend("falso", "m1", denied), workers=2)
-        self.assertLessEqual(len(calls), 2)  # los tramos que aún no habían empezado no se lanzan
+            def denied(system, user, attempts=attempts):
+                attempts.append(user)
+                raise bk.BackendUnavailable("La clave API no es válida.")
+
+            with self.assertRaisesRegex(bk.BackendUnavailable, "clave API"):
+                ex.extract_source(self.store, self.src, bk.Backend("falso", "m1", denied), workers=2)
+            time.sleep(0.01)  # deja terminar a la llamada que pudiera seguir en vuelo
+            self.assertLessEqual(len(attempts), 2)  # como mucho, las que ya estaban en vuelo
 
     def test_missing_source_or_transcript(self):
         with self.assertRaisesRegex(ValueError, "no existe"):

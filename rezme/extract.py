@@ -17,6 +17,7 @@ import json
 import math
 import re
 import secrets
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -542,9 +543,20 @@ def extract_source(store: Store, source_id: int, backend: Backend, *, domain: st
     def label(chunk: Chunk) -> str:
         return f"Tramo {chunk.index + 1}/{len(chunks)} [{hms(chunk.start)}–{hms(chunk.end)}]"
 
+    # Si el modelo deja de estar disponible (clave, saldo, tope de gasto), los tramos en cola no
+    # deben llegar a llamarlo: cancelar los futuros no basta, porque un fallo inmediato deja libre
+    # el hilo antes de que el hilo principal se entere.
+    halted = threading.Event()
+
     def work(chunk: Chunk) -> tuple[Parsed, int, int]:
+        if halted.is_set():
+            raise BackendUnavailable("extracción detenida")
         user = build_user_prompt(source, chunk, len(chunks), prompt_version)
-        parsed, calls = extract_chunk(backend.call, system, user, source_id, prompt_version)
+        try:
+            parsed, calls = extract_chunk(backend.call, system, user, source_id, prompt_version)
+        except BackendUnavailable:
+            halted.set()
+            raise
         return parsed, calls, len(user)
 
     def outcomes() -> Iterator[tuple[Chunk, tuple[Parsed, int, int] | None, Exception | None]]:
