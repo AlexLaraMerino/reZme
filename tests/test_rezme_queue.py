@@ -115,7 +115,7 @@ class MigrationTests(unittest.TestCase):
             with Store(path) as store:
                 self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0],
                                  SCHEMA_VERSION)
-                self.assertEqual(SCHEMA_VERSION, 4)
+                self.assertEqual(SCHEMA_VERSION, 6)
                 stats = store.stats()
                 self.assertEqual((stats["sources"], stats["transcripts"], stats["claims"],
                                   stats["extraction_runs"], stats["jobs"]), (1, 1, 1, 1, 0))

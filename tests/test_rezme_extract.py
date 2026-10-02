@@ -418,7 +418,8 @@ class ExtractTests(ExtractBase):
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'claims_fts%'")}
         self.assertEqual(tables, {"sources", "transcripts", "extraction_runs", "entities",
                                   "entity_aliases", "claims", "implications", "forecasts",
-                                  "source_profiles", "jobs", "claim_relations"})
+                                  "source_profiles", "jobs", "claim_relations", "merge_proposals",
+                                  "entity_merges"})
         self.assertEqual(self.store.stats()["jobs"], 0)  # extraer no encola trabajo alguno
 
     def test_transcript_cannot_close_its_own_tag(self):

@@ -15,6 +15,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
+from .units import normalize as normalize_metric
 from .schema import (
     CLAIM_STATUSES, CLAIM_TYPES, DIRECTIONS, ENTITY_TYPES, EVIDENCE_GRADES,
     FORECAST_RESOLUTIONS, IMPLICATION_BASES, JOB_STAGES, JOB_STATUSES, KNOWLEDGE_FIELDS,
@@ -56,7 +57,9 @@ CREATE TABLE claims (
     mechanism_json TEXT NOT NULL DEFAULT '[]',
     applies_when_json TEXT NOT NULL DEFAULT '[]',
     fails_when_json TEXT NOT NULL DEFAULT '[]',
-    tags_json TEXT NOT NULL DEFAULT '[]'
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    metric_value_abs REAL,
+    metric_unit_base TEXT
 );
 """
 
@@ -99,6 +102,29 @@ CREATE TABLE claim_relations (
     CHECK (from_claim_id != to_claim_id)
 );
 CREATE INDEX idx_relation_to ON claim_relations(to_claim_id);
+"""
+
+# Limpieza del catálogo: propuestas de fusión de entidades y registro de las ya hechas.
+CATALOG_DDL = """
+CREATE TABLE merge_proposals (
+    id INTEGER PRIMARY KEY,
+    into_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    from_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    origin TEXT NOT NULL CHECK (origin IN ('rule', 'model')),
+    reason TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'dismissed')),
+    created_at TEXT NOT NULL,
+    UNIQUE (into_entity_id, from_entity_id),
+    CHECK (into_entity_id != from_entity_id)
+);
+CREATE TABLE entity_merges (
+    id INTEGER PRIMARY KEY,
+    into_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    from_name TEXT NOT NULL, from_type TEXT NOT NULL,
+    claims_moved INTEGER NOT NULL, origin TEXT, reason TEXT,
+    created_at TEXT NOT NULL,
+    moved_json TEXT
+);
 """
 
 # Cola de procesamiento por lotes: un trabajo por vídeo.
@@ -207,7 +233,7 @@ CREATE TABLE source_profiles (
     updated_at TEXT NOT NULL,
     UNIQUE (platform, channel_id)
 );
-""" + JOBS_DDL + RELATIONS_DDL
+""" + JOBS_DDL + RELATIONS_DDL + CATALOG_DDL
 
 # Pasos desde cada versión antigua hasta la actual.
 _MIGRATIONS = {
@@ -218,6 +244,7 @@ ALTER TABLE extraction_runs ADD COLUMN transcript_id INTEGER
 ALTER TABLE extraction_runs ADD COLUMN stats_json TEXT NOT NULL DEFAULT '{}';
 """,
     2: JOBS_DDL,
+    4: CATALOG_DDL,
 }
 
 # Columnas de `claims` anteriores a la v4, para copiar los datos al reconstruir la tabla.
@@ -228,7 +255,7 @@ _CLAIM_COLUMNS_V3 = (
     "captured_at, expires_at, fingerprint")
 
 _STATS_TABLES = ("sources", "transcripts", "entities", "claims", "implications",
-                 "forecasts", "extraction_runs", "jobs", "claim_relations")
+                 "forecasts", "extraction_runs", "jobs", "claim_relations", "entity_merges")
 _JOB_FIELDS = frozenset({"status", "stage", "attempts", "last_error", "priority", "started_at",
                          "finished_at", "notes", "title"})
 
@@ -286,8 +313,28 @@ class Store:
             if step == 3:
                 self._migrate_claims_v4()
                 continue
+            if step == 5:
+                self._migrate_v6()
+                continue
             self.db.executescript(
                 f"BEGIN;\n{_MIGRATIONS[step]}\nPRAGMA user_version = {step + 1};\nCOMMIT;")
+
+    def _migrate_v6(self) -> None:
+        """v5 -> v6: cifras normalizadas en `claims` y detalle de cada fusión para poder deshacerla."""
+        with self.db:
+            # Una base que viene de v3 o anterior ya ha recreado estas tablas con la forma actual.
+            columns = lambda table: {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if "metric_value_abs" not in columns("claims"):
+                self.db.execute("ALTER TABLE claims ADD COLUMN metric_value_abs REAL")
+                self.db.execute("ALTER TABLE claims ADD COLUMN metric_unit_base TEXT")
+            if "moved_json" not in columns("entity_merges"):
+                self.db.execute("ALTER TABLE entity_merges ADD COLUMN moved_json TEXT")
+            rows = self.db.execute("SELECT id, metric_value, metric_unit FROM claims "
+                                   "WHERE metric_value IS NOT NULL").fetchall()
+            self.db.executemany(
+                "UPDATE claims SET metric_value_abs=?, metric_unit_base=? WHERE id=?",
+                [(*normalize_metric(r["metric_value"], r["metric_unit"]), r["id"]) for r in rows])
+            self.db.execute("PRAGMA user_version = 6")
 
     def _migrate_claims_v4(self) -> None:
         """v3 -> v4: tipos nuevos y campos de conocimiento en `claims`, relaciones entre afirmaciones.
@@ -480,6 +527,164 @@ class Store:
                LEFT JOIN entity_aliases a ON a.entity_id = e.id
                WHERE e.norm_name = ? OR a.norm_alias = ? ORDER BY e.id""", (norm, norm))]
 
+    def list_entities(self) -> list[dict[str, Any]]:
+        """Todas las entidades con sus alias y cuántas afirmaciones verificadas tienen."""
+        aliases: dict[int, list[str]] = {}
+        for row in self.db.execute("SELECT entity_id, alias FROM entity_aliases ORDER BY id"):
+            aliases.setdefault(row["entity_id"], []).append(row["alias"])
+        out = []
+        for row in self.db.execute(
+                """SELECT e.id, e.type, e.canonical_name, e.norm_name, e.external_ids_json,
+                          (SELECT COUNT(*) FROM claims c
+                            WHERE c.entity_id = e.id AND c.status = 'verified') AS claims
+                   FROM entities e ORDER BY e.id"""):
+            item = dict(row)
+            item["external_ids"] = json.loads(item.pop("external_ids_json"))
+            item["aliases"] = aliases.get(row["id"], [])
+            out.append(item)
+        return out
+
+    def merge_entities(self, into_id: int, from_id: int, *, origin: str | None = None,
+                       reason: str | None = None) -> int:
+        """Fusiona `from_id` dentro de `into_id`. Devuelve cuántas afirmaciones cambian de entidad.
+
+        Las afirmaciones e implicaciones pasan a la entidad que queda; el nombre y los alias de la
+        absorbida se conservan como alias, así que las próximas extracciones ya la reconocen.
+        """
+        if into_id == from_id:
+            raise ValidationError("no se puede fusionar una entidad consigo misma")
+        target, source = self.get_entity(into_id), self.get_entity(from_id)
+        if target is None or source is None:
+            raise KeyError("alguna de las entidades ya no existe")
+        with self.db:
+            claim_ids = [r["id"] for r in self.db.execute(
+                "SELECT id FROM claims WHERE entity_id=?", (from_id,))]
+            implication_ids = [r["id"] for r in self.db.execute(
+                "SELECT id FROM implications WHERE target_entity_id=?", (from_id,))]
+            moved = self.db.execute("UPDATE claims SET entity_id=? WHERE entity_id=?",
+                                    (into_id, from_id)).rowcount
+            self.db.execute("UPDATE implications SET target_entity_id=? WHERE target_entity_id=?",
+                            (into_id, from_id))
+            added_aliases = []
+            for alias in (source["canonical_name"], *source["aliases"]):
+                norm = normalize_name(alias)
+                if norm and norm != target["norm_name"]:
+                    cur = self.db.execute(
+                        "INSERT OR IGNORE INTO entity_aliases (entity_id, alias, norm_alias)"
+                        " VALUES (?,?,?)", (into_id, alias.strip(), norm))
+                    if cur.rowcount:
+                        added_aliases.append(norm)
+            detail = {"claims": claim_ids, "implications": implication_ids, "aliases": added_aliases,
+                      "source_aliases": source["aliases"], "source_external_ids": source["external_ids"],
+                      "target_external_ids": target["external_ids"]}
+            merged = {**source["external_ids"], **target["external_ids"]}
+            self.db.execute("UPDATE entities SET external_ids_json=? WHERE id=?",
+                            (json.dumps(merged, ensure_ascii=False), into_id))
+            # Las propuestas que apuntaban a la absorbida pasan a apuntar a la que queda.
+            self.db.execute("UPDATE OR IGNORE merge_proposals SET into_entity_id=? "
+                            "WHERE into_entity_id=? AND from_entity_id != ?", (into_id, from_id, into_id))
+            self.db.execute("UPDATE OR IGNORE merge_proposals SET from_entity_id=? "
+                            "WHERE from_entity_id=? AND into_entity_id != ?", (into_id, from_id, into_id))
+            self.db.execute(
+                """INSERT INTO entity_merges (into_entity_id, from_name, from_type, claims_moved,
+                    origin, reason, created_at, moved_json) VALUES (?,?,?,?,?,?,?,?)""",
+                (into_id, source["canonical_name"], source["type"], moved, origin, reason, utc_now(),
+                 json.dumps(detail, ensure_ascii=False)))
+            self.db.execute("DELETE FROM entities WHERE id=?", (from_id,))
+        return moved
+
+    def entity_merges(self) -> list[dict[str, Any]]:
+        """Fusiones hechas, la más reciente primero. `undoable` si se guardó qué se movió."""
+        return [dict(r) for r in self.db.execute(
+            """SELECT m.id, m.from_name, m.from_type, m.claims_moved, m.origin, m.reason,
+                      m.created_at, m.into_entity_id, e.canonical_name AS into_name,
+                      m.moved_json IS NOT NULL AS undoable
+               FROM entity_merges m JOIN entities e ON e.id = m.into_entity_id
+               ORDER BY m.id DESC""")]
+
+    def undo_merge(self, merge_id: int) -> int:
+        """Deshace una fusión: recrea la entidad absorbida y le devuelve lo que era suyo.
+
+        La pareja queda descartada como propuesta, para que no vuelva a sugerirse.
+        """
+        row = self.db.execute("SELECT * FROM entity_merges WHERE id=?", (merge_id,)).fetchone()
+        if row is None:
+            raise KeyError("esa fusión no existe")
+        if row["moved_json"] is None:
+            raise ValidationError("esta fusión es anterior al registro de detalle y no se puede deshacer")
+        detail = json.loads(row["moved_json"])
+        into_id = row["into_entity_id"]
+        with self.db:
+            for norm in detail["aliases"]:
+                self.db.execute("DELETE FROM entity_aliases WHERE entity_id=? AND norm_alias=?",
+                                (into_id, norm))
+            self.db.execute("UPDATE entities SET external_ids_json=? WHERE id=?",
+                            (json.dumps(detail["target_external_ids"], ensure_ascii=False), into_id))
+        restored = self.upsert_entity(row["from_type"], row["from_name"], detail["source_aliases"],
+                                      detail["source_external_ids"])
+        with self.db:
+            marks = ",".join("?" * len(detail["claims"])) or "NULL"
+            moved = self.db.execute(
+                f"UPDATE claims SET entity_id=? WHERE entity_id=? AND id IN ({marks})",
+                (restored, into_id, *detail["claims"])).rowcount
+            marks = ",".join("?" * len(detail["implications"])) or "NULL"
+            self.db.execute(
+                f"UPDATE implications SET target_entity_id=? WHERE target_entity_id=? AND id IN ({marks})",
+                (restored, into_id, *detail["implications"]))
+            self.db.execute("DELETE FROM entity_merges WHERE id=?", (merge_id,))
+        if self.add_merge_proposal(into_id, restored, row["origin"] or "rule", row["reason"]):
+            pending = [p["id"] for p in self.merge_proposals()
+                       if {p["into_entity_id"], p["from_entity_id"]} == {into_id, restored}]
+            self.dismiss_merge_proposals(pending)
+        return moved
+
+    def add_merge_proposal(self, into_id: int, from_id: int, origin: str,
+                           reason: str | None = None) -> bool:
+        """Propone fusionar dos entidades. False si ya estaba propuesta (o descartada) en algún sentido."""
+        if into_id == from_id:
+            return False
+        exists = self.db.execute(
+            """SELECT 1 FROM merge_proposals WHERE (into_entity_id=? AND from_entity_id=?)
+               OR (into_entity_id=? AND from_entity_id=?)""", (into_id, from_id, from_id, into_id)).fetchone()
+        if exists:
+            return False
+        with self.db:
+            self.db.execute(
+                "INSERT INTO merge_proposals (into_entity_id, from_entity_id, origin, reason, created_at)"
+                " VALUES (?,?,?,?,?)", (into_id, from_id, origin, reason, utc_now()))
+        return True
+
+    def merge_proposals(self, status: str = "pending") -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            """SELECT p.id, p.origin, p.reason, p.into_entity_id, p.from_entity_id,
+                      a.canonical_name AS into_name, a.type AS into_type,
+                      b.canonical_name AS from_name, b.type AS from_type,
+                      (SELECT COUNT(*) FROM claims c WHERE c.entity_id=a.id AND c.status='verified') AS into_claims,
+                      (SELECT COUNT(*) FROM claims c WHERE c.entity_id=b.id AND c.status='verified') AS from_claims
+               FROM merge_proposals p JOIN entities a ON a.id=p.into_entity_id
+               JOIN entities b ON b.id=p.from_entity_id
+               WHERE p.status=? ORDER BY into_claims + from_claims DESC, p.id""", (status,))]
+
+    def dismiss_merge_proposals(self, ids: Iterable[int]) -> int:
+        ids = list(ids)
+        if not ids:
+            return 0
+        with self.db:
+            cur = self.db.execute(
+                f"UPDATE merge_proposals SET status='dismissed' WHERE id IN ({','.join('?' * len(ids))})", ids)
+        return cur.rowcount
+
+    def backup(self, suffix: str) -> str | None:
+        """Copia de seguridad junto a la base (`rezme.db.<suffix>.bak`). None si es en memoria."""
+        if self.path == ":memory:":
+            return None
+        target = f"{self.path}.{suffix}.bak"
+        copy = sqlite3.connect(target)
+        with copy:
+            self.db.backup(copy)
+        copy.close()
+        return target
+
     def get_entity(self, entity_id: int) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM entities WHERE id=?", (entity_id,)).fetchone()
         if row is None:
@@ -573,8 +778,8 @@ class Store:
                     metric_period, currency, as_of, valid_from, valid_to, horizon, ts_start,
                     ts_end, quote, confidence, attrs_json, status, published_at, captured_at,
                     expires_at, fingerprint, title, mechanism_json, applies_when_json,
-                    fails_when_json, tags_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    fails_when_json, tags_json, metric_value_abs, metric_unit_base)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (claim.source_id, claim.transcript_id, claim.run_id, claim.entity_id, claim.type,
                  claim.domain, claim.statement.strip(), claim.evidence_grade, claim.stance,
                  claim.metric_name, claim.metric_value, claim.metric_unit, claim.metric_period,
@@ -583,7 +788,8 @@ class Store:
                  json.dumps(claim.attrs, ensure_ascii=False), claim.status, published, captured,
                  expires, fingerprint, claim.title,
                  *(json.dumps(getattr(claim, name), ensure_ascii=False)
-                   for name in (*KNOWLEDGE_FIELDS, "tags"))))
+                   for name in (*KNOWLEDGE_FIELDS, "tags")),
+                 *normalize_metric(claim.metric_value, claim.metric_unit)))
         return cur.lastrowid, True
 
     def set_claim_status(self, claim_id: int, status: str) -> None:
