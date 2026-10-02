@@ -91,6 +91,31 @@ def full(claim: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in out.items() if v not in (None, [], "")}
 
 
+RESOLUTION_LABELS = {"pending": "sin resolver", "correct": "acertó", "incorrect": "falló",
+                     "partial": "acertó a medias", "void": "no evaluable"}
+
+
+def forecast_status(store: Store, claim_id: int) -> dict[str, Any] | None:
+    """Estado de una previsión en el libro: fecha objetivo y si ya se sabe si acertó."""
+    row = store.db.execute("SELECT target_date, resolution, resolved_at, notes FROM forecasts WHERE claim_id=?",
+                           (claim_id,)).fetchone()
+    if row is None:
+        return None
+    return {k: v for k, v in {"vence": row["target_date"], "resultado": RESOLUTION_LABELS[row["resolution"]],
+                              "resuelta_el": (row["resolved_at"] or "")[:10] or None, "nota": row["notes"]}.items()
+            if v is not None}
+
+
+def channel_track_record(store: Store) -> list[dict[str, Any]]:
+    """Historial de cada canal para ponderarlo: aciertos de previsiones resueltas y contraste con otros."""
+    from .calibration import channel_profiles
+    return [{"canal": p["channel"], "videos": p["videos"], "afirmaciones_verificadas": p["verified"],
+             "previsiones": p["forecasts"], "previsiones_resueltas": p["resolved"],
+             "tasa_acierto": p["hit_rate"],   # None si aún no hay previsiones resueltas: no es un cero
+             "afirmaciones_apoyadas_por_otros": p["supported"],
+             "afirmaciones_contradichas_por_otros": p["contradicted"]} for p in channel_profiles(store)]
+
+
 def search(store: Store, query: str, *, tipo: str | None = None, etiqueta: str | None = None,
            entidad: str | None = None, a_fecha: str | None = None, incluir_caducadas: bool = False,
            min_apoyos: int = 0, limite: int = 15) -> list[dict[str, Any]]:
@@ -231,6 +256,7 @@ def overview(store: Store) -> dict[str, Any]:
     return {"videos": stats["sources"], "afirmaciones_verificadas": stats["claims_by_status"].get("verified", 0),
             "vigentes_hoy": vigentes, "entidades": stats["entities"], "canales": channels,
             "entidades_mas_tratadas": top, "tipos": list(CLAIM_TYPES), "etiquetas": list(DECISION_TAGS),
+            "historial_de_canales": channel_track_record(store),
             "aviso": NOTICE}
 
 

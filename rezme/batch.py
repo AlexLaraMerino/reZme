@@ -123,6 +123,7 @@ class PlaylistEntry:
 class AddReport:
     added: int = 0
     already: int = 0
+    channels: int = 0
     queued_for_extract: int = 0
     inaccessible: list[tuple[str, str]] = field(default_factory=list)  # (vídeo, motivo)
     invalid: list[str] = field(default_factory=list)
@@ -145,12 +146,31 @@ def playlist_id(url: str, *, force: bool = False) -> str | None:
     return list_id if force or parts.path.rstrip("/") == "/playlist" else None
 
 
-def expand_playlist(url: str, cookies_from: str | None = None) -> list[PlaylistEntry]:
-    """Vídeos de una lista, en orden, sin descargar nada (yt-dlp `extract_flat`)."""
+_CHANNEL_RE = re.compile(r"^/(@[^/]+|channel/UC[\w-]{10,}|c/[^/]+|user/[^/]+)(?:/(videos|featured|streams|shorts)?)?/?$")
+DEFAULT_CHANNEL_LIMIT = 50
+
+
+def channel_url(url: str) -> str | None:
+    """URL canónica de la pestaña de vídeos de un canal de YouTube, o None si no es un canal."""
+    parts = urlparse(url.strip())
+    if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() not in _YT_HOSTS:
+        return None
+    match = _CHANNEL_RE.match(parts.path)
+    return f"https://www.youtube.com/{match.group(1)}/videos" if match else None
+
+
+def expand_playlist(url: str, cookies_from: str | None = None,
+                    limit: int | None = None) -> list[PlaylistEntry]:
+    """Vídeos de una lista o de un canal, en orden, sin descargar nada (yt-dlp `extract_flat`).
+
+    Con `limit` solo se piden los primeros (en un canal, los más recientes).
+    """
     from yt_dlp import YoutubeDL
 
     opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "skip_download": True,
                             "extract_flat": True, "ignoreerrors": True, "socket_timeout": 30}
+    if limit:
+        opts["playlistend"] = int(limit)
     if cookies_from:
         opts["cookiesfrombrowser"] = (cookies_from,)
     with YoutubeDL(opts) as ydl:
@@ -207,16 +227,23 @@ def _enqueue(store: Store, video_id: str, playlist_url: str | None, title: str |
 
 
 def add_urls(store: Store, urls: Sequence[str], *, priority: int = 0, whole_playlist: bool = False,
-             cookies_from: str | None = None,
+             cookies_from: str | None = None, channel_limit: int | None = DEFAULT_CHANNEL_LIMIT,
              expand: Callable[..., list[PlaylistEntry]] | None = None) -> AddReport:
-    """Encola vídeos sueltos y listas, sin duplicar ni lo encolado ni lo ya ingerido."""
+    """Encola vídeos sueltos, listas y canales, sin duplicar ni lo encolado ni lo ya ingerido.
+
+    De un canal se toman como mucho los `channel_limit` vídeos más recientes.
+    """
     expand = expand or expand_playlist
     report = AddReport()
     for raw in urls:
         list_id = playlist_id(raw, force=whole_playlist)
-        if list_id:
-            playlist_url = f"https://www.youtube.com/playlist?list={list_id}"
-            for entry in expand(playlist_url, cookies_from):
+        channel = None if list_id else channel_url(raw)
+        if list_id or channel:
+            playlist_url = channel or f"https://www.youtube.com/playlist?list={list_id}"
+            report.channels += channel is not None
+            entries = (expand(playlist_url, cookies_from, limit=channel_limit) if channel and channel_limit
+                       else expand(playlist_url, cookies_from))
+            for entry in entries:
                 label = entry.title or entry.video_id or "vídeo sin identificar"
                 if entry.reason:
                     report.inaccessible.append((label, entry.reason))

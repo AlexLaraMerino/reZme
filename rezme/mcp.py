@@ -106,6 +106,10 @@ class Server:
                 if claim is None:
                     raise ValueError(f"no existe la afirmación {args['id']}")
                 out = agents.full(claim)
+                if claim["type"] == "forecast":
+                    status = agents.forecast_status(store, claim["id"])
+                    if status:
+                        out["prevision"] = status
                 if claim["status"] != "verified":
                     out["aviso"] = f"estado: {claim['status']} (no es una afirmación verificada vigente)"
                 return out

@@ -115,7 +115,7 @@ class MigrationTests(unittest.TestCase):
             with Store(path) as store:
                 self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0],
                                  SCHEMA_VERSION)
-                self.assertEqual(SCHEMA_VERSION, 7)
+                self.assertEqual(SCHEMA_VERSION, 8)
                 stats = store.stats()
                 self.assertEqual((stats["sources"], stats["transcripts"], stats["claims"],
                                   stats["extraction_runs"], stats["jobs"]), (1, 1, 1, 1, 0))
@@ -251,7 +251,38 @@ class AddTests(QueueBase):
             (IDS[2], "solo para miembros del canal")])
         self.assertEqual((seen["extract_flat"], seen["skip_download"], seen["download"]),
                          (True, True, False))
+        self.assertNotIn("playlistend", seen)
+        with mock.patch.dict("sys.modules", {"yt_dlp": SimpleNamespace(YoutubeDL=FakeYDL)}):
+            batch.expand_playlist("https://www.youtube.com/@LeoCui/videos", None, limit=25)
+        self.assertEqual(seen["playlistend"], 25)
         self.assertEqual(seen["cookiesfrombrowser"], ("firefox",))
+
+    def test_channel_urls_are_recognised_and_expanded_with_a_limit(self):
+        ok = {"https://www.youtube.com/@LeoCui": "https://www.youtube.com/@LeoCui/videos",
+              "https://www.youtube.com/@LeoCui/videos": "https://www.youtube.com/@LeoCui/videos",
+              "https://youtube.com/channel/UCJ5gGCjn6ItdPQF0ZO9YROA/featured":
+                  "https://www.youtube.com/channel/UCJ5gGCjn6ItdPQF0ZO9YROA/videos",
+              "https://www.youtube.com/c/Nombre/": "https://www.youtube.com/c/Nombre/videos"}
+        for raw, expected in ok.items():
+            self.assertEqual(batch.channel_url(raw), expected, raw)
+        for bad in (url(IDS[0]), PLAYLIST, "https://www.youtube.com/", "https://example.com/@LeoCui",
+                    "https://www.youtube.com/@LeoCui/about", "https://www.youtube.com/watch"):
+            self.assertIsNone(batch.channel_url(bad), bad)
+
+        calls = []
+
+        def expand(target, cookies_from, limit=None):
+            calls.append((target, limit))
+            return [batch.PlaylistEntry(IDS[0], "Reciente"), batch.PlaylistEntry(IDS[1], "Anterior")][:limit]
+
+        report = batch.add_urls(self.store, ["https://www.youtube.com/@LeoCui", PLAYLIST], expand=expand,
+                                channel_limit=1)
+        self.assertEqual(calls, [("https://www.youtube.com/@LeoCui/videos", 1), (PLAYLIST, None)])
+        self.assertEqual((report.added, report.already, report.channels), (2, 1, 1))
+        jobs = self.store.list_jobs()
+        self.assertEqual(jobs[0]["playlist_url"], "https://www.youtube.com/@LeoCui/videos")
+        batch.add_urls(self.store, ["https://www.youtube.com/@Otro"], expand=expand, channel_limit=0)
+        self.assertEqual(calls[-1], ("https://www.youtube.com/@Otro/videos", None))   # 0 = sin límite
 
     def test_read_urls_ignores_blanks_and_comments(self):
         text = f"# mi lista\n\n{url(IDS[0])}\n  {url(IDS[1])}  # comentario\n#{url(IDS[2])}\n"

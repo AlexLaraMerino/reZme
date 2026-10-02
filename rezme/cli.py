@@ -204,8 +204,8 @@ def cmd_queue_add(args: argparse.Namespace) -> int:
         return 1
     with Store(db_path(args.db)) as store:
         try:
-            report = batch.add_urls(store, urls, priority=args.priority,
-                                    whole_playlist=args.playlist, cookies_from=args.cookies_from)
+            report = batch.add_urls(store, urls, priority=args.priority, whole_playlist=args.playlist,
+                                    cookies_from=args.cookies_from, channel_limit=args.max_per_channel)
         except Exception as exc:  # yt-dlp al expandir una lista
             print(f"No se pudo leer la lista: {batch.classify_error(exc)[1]}", file=sys.stderr)
             return 1
@@ -419,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
     qa.add_argument("--playlist", action="store_true",
                     help="Expandir la lista entera aunque la URL sea de un vídeo con list=")
     qa.add_argument("--cookies-from", metavar="NAVEGADOR", help="Para listas privadas")
+    qa.add_argument("--max-per-channel", type=int, default=50, metavar="N",
+                    help="De un canal, cuántos vídeos recientes encolar (0 = todos)")
     qa.set_defaults(func=cmd_queue_add)
 
     qr = qsub.add_parser("run", parents=[common], help="Procesar la cola, vídeo a vídeo")

@@ -246,7 +246,10 @@ CREATE TABLE forecasts (
     target_date TEXT,
     resolution TEXT NOT NULL DEFAULT 'pending'
         CHECK (resolution IN ({_in(FORECAST_RESOLUTIONS)})),
-    resolved_at TEXT, notes TEXT
+    resolved_at TEXT, notes TEXT,
+    horizon_text TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    suggestion_json TEXT
 );
 
 CREATE TABLE source_profiles (
@@ -369,8 +372,21 @@ class Store:
             if step == 6:
                 self._migrate_v7()
                 continue
+            if step == 7:
+                self._migrate_v8()
+                continue
             self.db.executescript(
                 f"BEGIN;\n{_MIGRATIONS[step]}\nPRAGMA user_version = {step + 1};\nCOMMIT;")
+
+    def _migrate_v8(self) -> None:
+        """v7 -> v8: libro de previsiones (horizonte dicho, evidencia y sugerencia de resolución)."""
+        with self.db:
+            columns = {r[1] for r in self.db.execute("PRAGMA table_info(forecasts)")}
+            for name, definition in (("horizon_text", "TEXT"), ("evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+                                     ("suggestion_json", "TEXT")):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE forecasts ADD COLUMN {name} {definition}")
+            self.db.execute("PRAGMA user_version = 8")
 
     def _migrate_v7(self) -> None:
         """v6 -> v7: motivo de cada relación y registro de las entidades ya contrastadas."""
