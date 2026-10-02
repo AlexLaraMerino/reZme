@@ -98,11 +98,35 @@ CREATE TABLE claim_relations (
     to_claim_id INTEGER NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
     basis TEXT NOT NULL CHECK (basis IN ({_in(IMPLICATION_BASES)})),
     created_at TEXT NOT NULL,
+    reason TEXT,
     UNIQUE (from_claim_id, relation, to_claim_id),
     CHECK (from_claim_id != to_claim_id)
 );
 CREATE INDEX idx_relation_to ON claim_relations(to_claim_id);
 """
+
+# Contraste entre vídeos: qué entidades se han cruzado ya y con qué afirmaciones.
+CROSS_DDL = """
+CREATE TABLE cross_checks (
+    entity_id INTEGER PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+    claims_hash TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+);
+"""
+
+# Recuento de canales independientes que apoyan o contradicen una afirmación (alias `c` y `s0`).
+_INDEPENDENT = """(SELECT COUNT(DISTINCT IFNULL(s2.channel_id, 's' || s2.id)) FROM claim_relations r
+    JOIN claims c2 ON c2.id = CASE WHEN r.from_claim_id = c.id THEN r.to_claim_id ELSE r.from_claim_id END
+    JOIN sources s2 ON s2.id = c2.source_id
+    WHERE r.relation = '{relation}' AND (r.from_claim_id = c.id OR r.to_claim_id = c.id)
+      AND c2.status = 'verified'
+      AND IFNULL(s2.channel_id, 's' || s2.id) != IFNULL(s0.channel_id, 's' || s0.id))"""
+_CLAIM_SELECT = ("SELECT c.*, e.canonical_name AS entity_name, s0.title AS source_title, "
+                 "s0.channel AS source_channel, "
+                 + _INDEPENDENT.format(relation="supports") + " AS supported_by, "
+                 + _INDEPENDENT.format(relation="contradicts") + " AS contradicted_by ")
+_CLAIM_JOINS = ("LEFT JOIN entities e ON e.id = c.entity_id "
+                "JOIN sources s0 ON s0.id = c.source_id ")
 
 # Limpieza del catálogo: propuestas de fusión de entidades y registro de las ya hechas.
 CATALOG_DDL = """
@@ -233,7 +257,7 @@ CREATE TABLE source_profiles (
     updated_at TEXT NOT NULL,
     UNIQUE (platform, channel_id)
 );
-""" + JOBS_DDL + RELATIONS_DDL + CATALOG_DDL
+""" + JOBS_DDL + RELATIONS_DDL + CATALOG_DDL + CROSS_DDL
 
 # Pasos desde cada versión antigua hasta la actual.
 _MIGRATIONS = {
@@ -255,7 +279,8 @@ _CLAIM_COLUMNS_V3 = (
     "captured_at, expires_at, fingerprint")
 
 _STATS_TABLES = ("sources", "transcripts", "entities", "claims", "implications",
-                 "forecasts", "extraction_runs", "jobs", "claim_relations", "entity_merges")
+                 "forecasts", "extraction_runs", "jobs", "claim_relations", "entity_merges",
+                 "cross_checks")
 _JOB_FIELDS = frozenset({"status", "stage", "attempts", "last_error", "priority", "started_at",
                          "finished_at", "notes", "title"})
 
@@ -316,8 +341,20 @@ class Store:
             if step == 5:
                 self._migrate_v6()
                 continue
+            if step == 6:
+                self._migrate_v7()
+                continue
             self.db.executescript(
                 f"BEGIN;\n{_MIGRATIONS[step]}\nPRAGMA user_version = {step + 1};\nCOMMIT;")
+
+    def _migrate_v7(self) -> None:
+        """v6 -> v7: motivo de cada relación y registro de las entidades ya contrastadas."""
+        with self.db:
+            columns = {r[1] for r in self.db.execute("PRAGMA table_info(claim_relations)")}
+            if "reason" not in columns:
+                self.db.execute("ALTER TABLE claim_relations ADD COLUMN reason TEXT")
+            self.db.executescript(CROSS_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
+            self.db.execute("PRAGMA user_version = 7")
 
     def _migrate_v6(self) -> None:
         """v5 -> v6: cifras normalizadas en `claims` y detalle de cada fusión para poder deshacerla."""
@@ -815,8 +852,7 @@ class Store:
     def claims_for_source(self, source_id: int, *, run_id: int | None = None,
                           status: str | None = None) -> list[dict[str, Any]]:
         """Afirmaciones de una fuente en cualquier estado (revisión, no para agentes)."""
-        sql = ("SELECT c.*, e.canonical_name AS entity_name FROM claims c "
-               "LEFT JOIN entities e ON e.id = c.entity_id WHERE c.source_id = ?")
+        sql = _CLAIM_SELECT + "FROM claims c " + _CLAIM_JOINS + "WHERE c.source_id = ?"
         params: list[Any] = [source_id]
         if run_id is not None:
             sql += " AND c.run_id = ?"
@@ -841,7 +877,7 @@ class Store:
         return cur.lastrowid
 
     def add_relation(self, from_claim_id: int, relation: str, to_claim_id: int,
-                     basis: str = "inferred_by_system") -> bool:
+                     basis: str = "inferred_by_system", reason: str | None = None) -> bool:
         """Relaciona dos afirmaciones (apoya, contradice, matiza…). False si ya existía."""
         if relation not in RELATION_TYPES:
             raise ValidationError(f"relation no válida: {relation!r}")
@@ -852,19 +888,21 @@ class Store:
         with self.db:
             cur = self.db.execute(
                 """INSERT OR IGNORE INTO claim_relations (from_claim_id, relation, to_claim_id, basis,
-                    created_at) VALUES (?,?,?,?,?)""",
-                (from_claim_id, relation, to_claim_id, basis, utc_now()))
+                    created_at, reason) VALUES (?,?,?,?,?,?)""",
+                (from_claim_id, relation, to_claim_id, basis, utc_now(), reason))
         return cur.rowcount > 0
 
     def relations_for(self, claim_id: int) -> list[dict[str, Any]]:
         """Relaciones en las que participa la afirmación, con el enunciado de la otra."""
         return [dict(r) for r in self.db.execute(
-            """SELECT r.id, r.relation, r.basis, r.from_claim_id, r.to_claim_id,
+            """SELECT r.id, r.relation, r.basis, r.reason, r.from_claim_id, r.to_claim_id,
                       CASE WHEN r.from_claim_id = ? THEN 'out' ELSE 'in' END AS direction,
-                      c.id AS other_id, c.statement AS other_statement, c.status AS other_status
+                      c.id AS other_id, c.statement AS other_statement, c.status AS other_status,
+                      c.source_id AS other_source_id, s.title AS other_title, s.channel AS other_channel
                FROM claim_relations r
                JOIN claims c ON c.id = CASE WHEN r.from_claim_id = ? THEN r.to_claim_id
                                             ELSE r.from_claim_id END
+               JOIN sources s ON s.id = c.source_id
                WHERE r.from_claim_id = ? OR r.to_claim_id = ? ORDER BY r.id""",
             (claim_id, claim_id, claim_id, claim_id))]
 
@@ -977,15 +1015,12 @@ class Store:
         now = known_at or utc_now()
         where, params = [], []  # type: list[str], list[Any]
         if query:
-            sql = ("SELECT c.*, e.canonical_name AS entity_name FROM claims_fts "
-                   "JOIN claims c ON c.id = claims_fts.rowid "
-                   "LEFT JOIN entities e ON e.id = c.entity_id ")
+            sql = _CLAIM_SELECT + "FROM claims_fts JOIN claims c ON c.id = claims_fts.rowid " + _CLAIM_JOINS
             where.append("claims_fts MATCH ?")
             params.append(_fts_query(query))
             order = "ORDER BY bm25(claims_fts)"
         else:
-            sql = ("SELECT c.*, e.canonical_name AS entity_name FROM claims c "
-                   "LEFT JOIN entities e ON e.id = c.entity_id ")
+            sql = _CLAIM_SELECT + "FROM claims c " + _CLAIM_JOINS
             order = "ORDER BY c.id DESC"
         if status:
             where.append("c.status = ?")

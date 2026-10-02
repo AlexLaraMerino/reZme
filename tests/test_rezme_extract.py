@@ -419,7 +419,7 @@ class ExtractTests(ExtractBase):
         self.assertEqual(tables, {"sources", "transcripts", "extraction_runs", "entities",
                                   "entity_aliases", "claims", "implications", "forecasts",
                                   "source_profiles", "jobs", "claim_relations", "merge_proposals",
-                                  "entity_merges"})
+                                  "entity_merges", "cross_checks"})
         self.assertEqual(self.store.stats()["jobs"], 0)  # extraer no encola trabajo alguno
 
     def test_transcript_cannot_close_its_own_tag(self):

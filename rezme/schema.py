@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 CLAIM_TYPES = (
     "fact", "statistic", "study_result", "causal_claim", "forecast", "opinion",
