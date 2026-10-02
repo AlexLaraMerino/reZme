@@ -512,8 +512,16 @@ def source_detail(store, source_id):
             implications.append(text + f" ({BASIS_LABELS.get(item['basis'], item['basis'])})")
         knowledge = lambda name: [{"text": k["text"], "stated": k["basis"] == "stated_by_source"}
                                   for k in row[name]]
-        relations = []
+        relations, cross = [], []
         for rel in store.relations_for(row["id"]):
+            if rel["other_status"] != "verified":
+                continue
+            if rel["other_source_id"] != source_id:  # otra fuente: es contraste, no estructura del vídeo
+                verb = {"supports": "Coincide", "contradicts": "Lo contradice", "refines": "Lo matiza"}.get(
+                    rel["relation"], RELATION_LABELS.get(rel["relation"], rel["relation"]).capitalize())
+                cross.append({"kind": rel["relation"], "text": f"{verb} {rel['other_channel'] or 'otra fuente'}: "
+                              f"{rel['other_statement']}" + (f" ({rel['reason']})" if rel["reason"] else "")})
+                continue
             label = RELATION_LABELS.get(rel["relation"], rel["relation"])
             arrow = label.capitalize() if rel["direction"] == "out" else f"Otra afirmación la {label}" \
                 if rel["relation"] in ("supports", "contradicts", "refines", "causes", "generalizes", "specializes") \
@@ -528,7 +536,8 @@ def source_detail(store, source_id):
             "implications": implications, "title": row["title"] or "",
             "mechanism": knowledge("mechanism"), "applies_when": knowledge("applies_when"),
             "fails_when": knowledge("fails_when"),
-            "tags": [TAG_LABELS.get(tag, tag) for tag in row["tags"]], "relations": relations})
+            "tags": [TAG_LABELS.get(tag, tag) for tag in row["tags"]], "relations": relations,
+            "supported_by": row["supported_by"], "contradicted_by": row["contradicted_by"], "cross": cross})
     return {"id": source_id, "title": source["title"] or source["external_id"], "url": source["url"] or "",
             "claims": claims}
 
@@ -579,16 +588,67 @@ def run_library(options):
         query = options.get("query", "").strip()
         if query:
             titles = {row["id"]: row["title"] for row in store.list_sources()}
+            known_at = str(options.get("known_at") or "").strip() or None
+            if known_at:
+                from rezme.schema import parse_iso, to_iso
+                try:
+                    known_at = to_iso(parse_iso(known_at)).replace("T00:00:00Z", "T23:59:59Z")
+                except ValueError:
+                    raise ValueError("La fecha debe tener la forma AAAA-MM-DD.") from None
             try:
-                rows = store.search_claims(query, limit=40)
+                rows = store.search_claims(query, limit=40, known_at=known_at)
             except ValueError:
                 rows = []
             emit("hits", items=[{
                 "id": row["id"], "statement": row["statement"],
+                "supported_by": row["supported_by"], "contradicted_by": row["contradicted_by"],
                 "meta": " · ".join(part for part in (
                     row["type"], row["entity_name"], titles.get(row["source_id"]),
                     digest.hms(row["ts_start"]) if row["ts_start"] is not None else None) if part),
             } for row in rows])
+
+
+def emit_cross(store):
+    from rezme import crosscheck
+    side = lambda p, which: {"text": p[f"{which}_statement"], "channel": p[f"{which}_channel"] or "",
+                             "title": p[f"{which}_title"] or ""}
+    pairs = [{"id": p["id"], "relation": p["relation"], "entity": p["entity"] or "", "reason": p["reason"] or "",
+              "a": side(p, "a"), "b": side(p, "b")} for p in crosscheck.cross_relations(store, limit=600)]
+    emit("cross", stats=crosscheck.summary(store), pairs=pairs)
+
+
+def run_cross(options):
+    """Contraste entre vídeos desde la app: cruza las afirmaciones de las entidades compartidas."""
+    from rezme import Store, backends, crosscheck
+
+    action = options.get("action", "status")
+    if action not in ("status", "run"):
+        raise ValueError("Acción de contraste no válida.")
+    if not options.get("db"):
+        raise ValueError("No se encuentra la base de datos de reZme.")
+    with Store(options["db"]) as store:
+        if action == "run":
+            backend, spent, _ = extraction_backend(options)
+            try:
+                workers = min(max(int(options.get("workers") or 1), 1), 4)
+            except ValueError:
+                workers = 1
+            try:
+                result = crosscheck.cross_check(store, backend.call, workers=workers,
+                                                progress=lambda message: emit("progress", message=message))
+            except backends.BudgetExceeded:
+                emit_cross(store)
+                emit("done", message=f"Tope de gasto alcanzado ({spent['cost']:.2f} $). Lo ya contrastado se conserva.")
+                return
+            except backends.BackendUnavailable as error:
+                emit_cross(store)
+                raise RuntimeError(f"Contraste detenido: {error}") from None
+            emit_cross(store)
+            emit("done", message=f"{result['revisadas']} entidades contrastadas · {result['supports']} coincidencias, "
+                                 f"{result['contradicts']} contradicciones y {result['refines']} matices nuevos · "
+                                 f"gasto {spent['cost']:.3f} $")
+            return
+        emit_cross(store)
 
 
 ENTITY_TYPE_LABELS = {
@@ -678,6 +738,8 @@ if __name__ == "__main__":
             run_library(options)
         elif options.get("mode") == "catalog":
             run_catalog(options)
+        elif options.get("mode") == "cross":
+            run_cross(options)
         else:
             run(options)
     except Exception as error:

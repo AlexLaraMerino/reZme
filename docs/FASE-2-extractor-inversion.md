@@ -282,3 +282,30 @@ casi la mitad con una sola afirmación, y la misma cosa con varios nombres
   fusiones propuestas por el modelo ya corrigen nombres mal transcritos
   («Kevin Wors» → «Kevin Warsh») y los dejan como alias.
 
+## 12. M3 · Contraste entre vídeos (esquema v7)
+
+Hasta aquí las relaciones solo unían afirmaciones del mismo tramo. M3 cruza las
+de **fuentes distintas**.
+
+- **Independencia por canal.** Dos vídeos del mismo canal no corroboran nada:
+  el recuento usa `channel_id` (o la fuente, si no lo hay).
+- **`rezme/crosscheck.py`.** Para cada entidad con afirmaciones verificadas de al
+  menos dos canales, se envían al modelo esas afirmaciones etiquetadas por canal
+  y devuelve parejas `supports`, `contradicts` o `refines`. Solo se aceptan ids
+  de la lista y parejas de canales distintos. Las entidades grandes se trocean
+  manteniendo dos canales por llamada.
+- **Sin regla de «misma cifra = apoyo».** Probada sobre datos reales emparejaba
+  un «5 %» de 2007 con un «5 %» actual; un apoyo falso infla justo la señal en
+  la que un agente se va a fiar.
+- **Incremental.** `cross_checks` guarda qué afirmaciones tenía cada entidad al
+  contrastarla; solo se repite si han cambiado.
+- **Corroboración en las consultas.** `search_claims` y `claims_for_source`
+  devuelven `supported_by` y `contradicted_by`: cuántos canales independientes
+  apoyan o contradicen cada afirmación. `claim_relations.reason` guarda el
+  motivo.
+- **Punto en el tiempo.** El buscador de la app acepta una fecha y usa
+  `known_at`: solo lo publicado hasta ese día y vigente entonces.
+- Límite conocido: solo se cruzan afirmaciones que comparten entidad. Las ideas
+  generales sin entidad (336 afirmaciones) no entran; necesitarían búsqueda
+  semántica (M4).
+

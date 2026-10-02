@@ -474,6 +474,64 @@ class DesktopTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.catalog(db, action="borrar-todo")
 
+    def test_contrast_from_the_app_and_point_in_time_search(self):
+        import os, tempfile
+        from rezme import Claim, Store
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "rezme.db")
+            with Store(db) as store:
+                leo, _ = store.add_source("youtube", "aaaaaaaaaa1", title="Leo sobre AST", channel="Leo",
+                                          channel_id="LEO", published_at="2026-03-01")
+                eme, _ = store.add_source("youtube", "bbbbbbbbbb2", title="Emérito sobre AST", channel="Emérito",
+                                          channel_id="EME", published_at="2026-09-01")
+                asts = store.upsert_entity("company", "AST SpaceMobile")
+                runs = {src: store.start_run(source_id=src, prompt_version="v5") for src in (leo, eme)}
+                yes, _ = store.add_claim(Claim(source_id=leo, statement="AST dará banda ancha masiva.", type="fact",
+                                               status="verified", entity_id=asts, run_id=runs[leo]))
+                no, _ = store.add_claim(Claim(source_id=eme, statement="AST no dará banda ancha: solo respaldo.",
+                                              type="fact", status="verified", entity_id=asts, run_id=runs[eme]))
+            run = lambda **options: self._run(worker.run_cross, dict(mode="cross", db=db, **options))
+            before = run(action="status")[-1]
+            self.assertEqual((before["stats"]["entidades"], before["stats"]["pendientes"], before["stats"]["llamadas"],
+                              before["pairs"]), (1, 1, 1, []))
+            answer = json.dumps({"relations": [{"a": no, "b": yes, "relation": "contradicts", "reason": "capacidad"}]})
+            with patch.object(worker, "call_meta_extract", return_value=answer) as call:
+                events = run(action="run", engine="meta", key="secret-test", model="m", price_in="1", price_out="1",
+                             budget="5", workers="2")
+            self.assertIn("canales distintos", call.call_args.args[0])
+            self.assertNotIn("secret-test", json.dumps(events))
+            self.assertIn("1 entidades contrastadas · 0 coincidencias, 1 contradicciones", events[-1]["message"])
+            pair = [e for e in events if e["type"] == "cross"][-1]["pairs"][0]
+            self.assertEqual((pair["relation"], pair["entity"], pair["a"]["channel"], pair["b"]["channel"], pair["reason"]),
+                             ("contradicts", "AST SpaceMobile", "Emérito", "Leo", "capacidad"))
+            with patch.object(worker, "call_meta_extract", side_effect=worker.MetaAccessError("La clave API no es válida.")):
+                with Store(db) as store:
+                    store.add_claim(Claim(source_id=eme, statement="Otra más.", type="fact", status="verified", entity_id=asts))
+                with self.assertRaisesRegex(RuntimeError, "Contraste detenido: La clave API no es válida."):
+                    run(action="run", engine="meta", key="k", model="m")
+
+            # La ficha del vídeo y el buscador muestran el contraste.
+            library = lambda **options: self._run(worker.run_library, dict(db=db, **options))
+            detail = next(e for e in library(source=str(leo)) if e["type"] == "detail")["claims"][0]
+            self.assertEqual((detail["supported_by"], detail["contradicted_by"]), (0, 1))
+            self.assertEqual(detail["cross"], [{"kind": "contradicts", "text":
+                             "Lo contradice Emérito: AST no dará banda ancha: solo respaldo. (capacidad)"}])
+            self.assertEqual(detail["relations"], [])
+            hits = lambda **options: next(e for e in library(query="banda ancha", **options) if e["type"] == "hits")["items"]
+            self.assertEqual({h["statement"]: h["contradicted_by"] for h in hits()},
+                             {"AST dará banda ancha masiva.": 1, "AST no dará banda ancha: solo respaldo.": 1})
+            # «Qué se sabía el 1 de junio»: el vídeo de septiembre aún no existía.
+            self.assertEqual([h["statement"] for h in hits(known_at="2026-06-01")], ["AST dará banda ancha masiva."])
+            self.assertEqual(hits(known_at="2025-01-01"), [])
+            with self.assertRaisesRegex(ValueError, "AAAA-MM-DD"):
+                hits(known_at="ayer")
+
+    def _run(self, function, options):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            function(options)
+        return [json.loads(line) for line in output.getvalue().splitlines()]
+
     def test_queue_status_empty_and_bad_input(self):
         import os, tempfile
         with tempfile.TemporaryDirectory() as tmp:

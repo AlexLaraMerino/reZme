@@ -35,7 +35,26 @@ enum KeyStore {
     static func delete() { SecItemDelete(query as CFDictionary) }
 }
 
-enum Pane: Hashable { case queue, library, cleanup, report, settings }
+enum Pane: Hashable { case queue, library, contrast, cleanup, report, settings }
+
+/// Dos afirmaciones de canales distintos y cómo se relacionan.
+struct CrossPair: Identifiable {
+    let id: Int
+    let relation: String
+    let entity: String
+    let reason: String
+    let aText: String
+    let aFrom: String
+    let bText: String
+    let bFrom: String
+}
+
+/// Relación de una afirmación con otra de otra fuente, ya redactada.
+struct CrossNote: Identifiable {
+    let id = UUID()
+    let kind: String
+    let text: String
+}
 
 /// Propuesta de fusionar una entidad (`drop`) dentro de otra (`keep`).
 struct MergeProposal: Identifiable {
@@ -97,6 +116,9 @@ struct ClaimItem: Identifiable {
     var failsWhen: [KnowledgeItem] = []
     var tags: [String] = []
     var relations: [String] = []
+    var supportedBy = 0
+    var contradictedBy = 0
+    var cross: [CrossNote] = []
 }
 
 struct SourceDetail {
@@ -112,6 +134,8 @@ struct ClaimHit: Identifiable {
     let id: Int
     let statement: String
     let meta: String
+    var supportedBy = 0
+    var contradictedBy = 0
 }
 
 /// Fusión ya aplicada, por si hay que deshacerla.
@@ -144,6 +168,14 @@ final class AppModel: ObservableObject {
     @Published var stats: [String: Int] = [:]
     @Published var query = ""
     @Published var hits: [ClaimHit]? = nil
+    // Contraste entre vídeos
+    @Published var crossStats: [String: Int] = [:]
+    @Published var crossPairs: [CrossPair] = []
+    @Published var crossFilter = "contradicts"
+    /// Fecha «como se sabía el…» para el buscador (AAAA-MM-DD), o vacía para hoy.
+    @Published var knownAt = ""
+    var shownPairs: [CrossPair] { crossPairs.filter { $0.relation == crossFilter } }
+
     // Limpieza del catálogo
     @Published var proposals: [MergeProposal] = []
     @Published var catalogStats: [String: Int] = [:]
@@ -251,6 +283,12 @@ final class AppModel: ObservableObject {
         text += " Puedes pausar cuando quieras: continuará donde lo dejó."
         return text
     }
+    var contrastHeadline: String {
+        let pending = crossStats["pendientes"] ?? 0
+        if busy == .contrast { return "Contrastando con \(engineName)…" }
+        if pending == 0 { return "Todo lo compartido entre canales está contrastado." }
+        return "\(pending) entidades por contrastar · unas \(crossStats["llamadas"] ?? 0) llamadas al modelo"
+    }
     func proposalDetail(_ proposal: MergeProposal) -> String {
         var text = "\(proposal.dropType), \(proposal.dropClaims) afirmaciones"
         text += " → \(proposal.keepType), \(proposal.keepClaims) afirmaciones"
@@ -340,7 +378,10 @@ final class AppModel: ObservableObject {
     func cancel() {
         let owner = busy
         generation = UUID(); process?.terminate(); process = nil; busy = nil; error = false
-        if owner == .queue || owner == .library {
+        if owner == .contrast {
+            status = "Contraste en pausa. Lo ya contrastado se conserva."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.cross("status") }
+        } else if owner == .queue || owner == .library {
             status = owner == .queue ? "Cola en pausa. Lo ya guardado se conserva." : "Extracción en pausa. Continuará donde lo dejó."
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.queue("status"); self.loadLibrary() }
         } else {
@@ -458,6 +499,7 @@ final class AppModel: ObservableObject {
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty { hits = nil }
         launch(["mode": "library", "db": database.path, "query": search ? text : "",
+                "known_at": knownAt.trimmingCharacters(in: .whitespaces),
                 "source": detail.map { String($0.id) } ?? ""], owner: nil, onEvent: { event in
             switch event["type"] as? String {
             case "detail":
@@ -477,7 +519,11 @@ final class AppModel: ObservableObject {
                                      implications: item["implications"] as? [String] ?? [],
                                      title: item["title"] as? String ?? "", mechanism: knowledge("mechanism"),
                                      appliesWhen: knowledge("applies_when"), failsWhen: knowledge("fails_when"),
-                                     tags: item["tags"] as? [String] ?? [], relations: item["relations"] as? [String] ?? [])
+                                     tags: item["tags"] as? [String] ?? [], relations: item["relations"] as? [String] ?? [],
+                                     supportedBy: item["supported_by"] as? Int ?? 0, contradictedBy: item["contradicted_by"] as? Int ?? 0,
+                                     cross: (item["cross"] as? [[String: Any]] ?? []).map {
+                                         CrossNote(kind: $0["kind"] as? String ?? "", text: $0["text"] as? String ?? "")
+                                     })
                 }
                 self.detail = SourceDetail(id: id, title: event["title"] as? String ?? "", url: event["url"] as? String ?? "", claims: claims)
             case "library":
@@ -494,8 +540,10 @@ final class AppModel: ObservableObject {
             case "hits":
                 self.hits = (event["items"] as? [[String: Any]] ?? []).compactMap { item in
                     guard let id = item["id"] as? Int else { return nil }
-                    return ClaimHit(id: id, statement: item["statement"] as? String ?? "", meta: item["meta"] as? String ?? "")
+                    return ClaimHit(id: id, statement: item["statement"] as? String ?? "", meta: item["meta"] as? String ?? "",
+                                    supportedBy: item["supported_by"] as? Int ?? 0, contradictedBy: item["contradicted_by"] as? Int ?? 0)
                 }
+            case "error": self.fail(event["message"] as? String ?? "No se pudo consultar la base.")
             default: break
             }
         })
@@ -507,6 +555,54 @@ final class AppModel: ObservableObject {
         } else {
             status = "La base se creará al guardar el primer vídeo."; error = false
         }
+    }
+
+    // MARK: Contraste entre vídeos
+
+    /// `run` cruza con el modelo las afirmaciones de las entidades que comparten varios canales.
+    func cross(_ action: String) {
+        let tracked = action == "run"
+        var payload = ["mode": "cross", "action": action, "db": database.path]
+        if tracked {
+            guard busy == nil else { status = "Hay una tarea en curso. Espera a que termine o páusala."; error = true; return }
+            error = false
+            if engine == "meta" {
+                loadKey()
+                if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    pane = .settings; fail("Introduce tu clave de Meta en los ajustes."); return
+                }
+            }
+            payload["engine"] = engine
+            payload["key"] = engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            payload["model"] = model
+            payload["budget"] = String(budgetValue)
+            payload["price_in"] = String(number(priceIn))
+            payload["price_out"] = String(number(priceOut))
+            payload["reasoning"] = reasoning
+            payload["workers"] = String(workers)
+        }
+        let started = launch(payload, owner: tracked ? .contrast : nil, onEvent: { event in
+            switch event["type"] as? String {
+            case "progress", "done": self.status = event["message"] as? String ?? ""
+            case "error": self.fail(event["message"] as? String ?? "No se pudo completar el contraste.")
+            case "cross":
+                self.crossStats = event["stats"] as? [String: Int] ?? [:]
+                self.crossPairs = (event["pairs"] as? [[String: Any]] ?? []).compactMap { item in
+                    guard let id = item["id"] as? Int, let a = item["a"] as? [String: Any], let b = item["b"] as? [String: Any] else { return nil }
+                    let origin: ([String: Any]) -> String = { side in
+                        [side["channel"] as? String ?? "", side["title"] as? String ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
+                    }
+                    return CrossPair(id: id, relation: item["relation"] as? String ?? "", entity: item["entity"] as? String ?? "",
+                                     reason: item["reason"] as? String ?? "", aText: a["text"] as? String ?? "", aFrom: origin(a),
+                                     bText: b["text"] as? String ?? "", bFrom: origin(b))
+                }
+            default: break
+            }
+        }, onExit: { ok in
+            if tracked && !ok && !self.error { self.fail("El contraste se ha interrumpido. Vuelve a lanzarlo: continuará con lo que falte.") }
+            if tracked { self.loadLibrary() }
+        })
+        if started && tracked { status = "Contrastando lo que dicen los distintos canales…" }
     }
 
     // MARK: Limpieza del catálogo
@@ -665,6 +761,7 @@ struct ContentView: View {
                     case .queue: queuePane
                     case .library: libraryPane
                     case .report: reportPane
+                    case .contrast: contrastPane
                     case .cleanup: cleanupPane
                     case .settings: settingsPane
                     }
@@ -675,7 +772,7 @@ struct ContentView: View {
             }.background(Color(nsColor: .textBackgroundColor))
         }
         .frame(minWidth: 980, minHeight: 700)
-        .onAppear { app.queue("status"); app.loadLibrary(); app.catalog("status") }
+        .onAppear { app.queue("status"); app.loadLibrary(); app.catalog("status"); app.cross("status") }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in app.cancel() }
     }
 
@@ -691,6 +788,7 @@ struct ContentView: View {
                 .padding(.bottom, 18)
             navItem(.queue, "Cola", "tray.and.arrow.down", badge: app.waiting)
             navItem(.library, "Base de conocimiento", "cylinder.split.1x2", badge: 0)
+            navItem(.contrast, "Contraste", "arrow.left.arrow.right", badge: 0)
             navItem(.cleanup, "Limpieza", "wand.and.stars", badge: app.proposals.count)
             navItem(.report, "Informe rápido", "doc.text", badge: 0)
             Spacer()
@@ -709,6 +807,7 @@ struct ContentView: View {
             if pane == .queue && app.busy == nil { app.queue("status") }
             if pane == .settings { app.loadKey() }
             if pane == .cleanup && app.busy == nil { app.catalog("status") }
+            if pane == .contrast && app.busy != .contrast { app.cross("status") }
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon).frame(width: 20)
@@ -851,6 +950,22 @@ struct ContentView: View {
 
     // MARK: Base de conocimiento
 
+    /// Cuántos canales independientes sostienen o contradicen la afirmación.
+    @ViewBuilder func corroboration(_ supported: Int, _ contradicted: Int) -> some View {
+        if supported > 0 || contradicted > 0 {
+            HStack(spacing: 10) {
+                if supported > 0 {
+                    Label(supported == 1 ? "Lo sostiene otro canal" : "Lo sostienen otros \(supported) canales", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(accent)
+                }
+                if contradicted > 0 {
+                    Label(contradicted == 1 ? "Lo contradice otro canal" : "Lo contradicen otros \(contradicted) canales", systemImage: "exclamationmark.circle.fill")
+                        .foregroundStyle(Color.orange)
+                }
+            }.font(.caption.weight(.medium))
+        }
+    }
+
     /// Bloque «Por qué / Aplica cuando / Falla cuando». La comilla marca lo que dice el autor.
     @ViewBuilder func knowledgeBlock(_ title: String, _ items: [KnowledgeItem]) -> some View {
         if !items.isEmpty {
@@ -899,6 +1014,12 @@ struct ContentView: View {
             }
             ForEach(claim.relations, id: \.self) { relation in
                 Label(relation, systemImage: "link").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            corroboration(claim.supportedBy, claim.contradictedBy)
+            ForEach(claim.cross) { note in
+                Label(note.text, systemImage: note.kind == "contradicts" ? "arrow.left.arrow.right" : "checkmark")
+                    .font(.caption).foregroundStyle(note.kind == "contradicts" ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             ForEach(claim.reasons, id: \.self) { reason in
                 Label("No verificada: \(reason)", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(Color.orange)
@@ -1001,6 +1122,9 @@ struct ContentView: View {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("Buscar en las afirmaciones verificadas", text: $app.query).textFieldStyle(.plain)
                     .onSubmit { app.loadLibrary(search: true) }
+                TextField("a fecha de AAAA-MM-DD", text: $app.knownAt).textFieldStyle(.plain).frame(width: 170)
+                    .font(.callout).foregroundStyle(.secondary).onSubmit { app.loadLibrary(search: true) }
+                    .help("Opcional: muestra solo lo que ya se sabía ese día y que entonces seguía vigente.")
                 if !app.query.isEmpty {
                     Button { app.query = ""; app.hits = nil } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(.secondary)
@@ -1019,6 +1143,7 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(hit.statement).textSelection(.enabled)
                             Text(hit.meta).font(.caption).foregroundStyle(.secondary)
+                            corroboration(hit.supportedBy, hit.contradictedBy)
                         }
                     }
                 }
@@ -1119,6 +1244,68 @@ struct ContentView: View {
                 }.padding(.bottom, 8)
                 TextEditor(text: $app.output).font(.system(size: 13, design: .monospaced)).lineSpacing(4)
                     .scrollContentBackground(.hidden)
+            }
+        }
+    }
+
+    // MARK: Contraste
+
+    func pairSide(_ text: String, _ origin: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(text).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Text(origin).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+    }
+
+    var contrastPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header("Contraste", "Qué dicen varias fuentes sobre lo mismo. Dos vídeos del mismo canal no cuentan como fuentes independientes.")
+            HStack(spacing: 10) {
+                tile(app.crossStats["canales"] ?? 0, "Canales")
+                tile(app.crossStats["entidades"] ?? 0, "Entidades compartidas")
+                tile(app.crossStats["apoyos"] ?? 0, "Coincidencias entre canales", accent)
+                tile(app.crossStats["contradicciones"] ?? 0, "Contradicciones", .orange)
+            }.padding(.bottom, 14)
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.left.arrow.right").font(.title3).foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(app.contrastHeadline).font(.system(size: 13, weight: .semibold))
+                    Text("El modelo compara, entidad por entidad, las afirmaciones de canales distintos y señala cuáles coinciden, cuáles se contradicen y cuáles se matizan.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if app.busy == .contrast {
+                    ProgressView().controlSize(.small)
+                    Button("Pausar", action: app.cancel)
+                } else {
+                    Button { app.cross("run") } label: { Label("Contrastar vídeos", systemImage: "arrow.right").padding(.horizontal, 4) }
+                        .buttonStyle(.borderedProminent).tint(accent).disabled(app.busy != nil || (app.crossStats["pendientes"] ?? 0) == 0)
+                }
+            }
+            .padding(13).background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            .padding(.bottom, 14)
+
+            Picker("", selection: $app.crossFilter) {
+                Text("Contradicciones (\(app.crossStats["contradicciones"] ?? 0))").tag("contradicts")
+                Text("Coincidencias (\(app.crossStats["apoyos"] ?? 0))").tag("supports")
+                Text("Matices (\(app.crossStats["matices"] ?? 0))").tag("refines")
+            }.pickerStyle(.segmented).labelsHidden().frame(width: 460).padding(.bottom, 8)
+
+            if app.shownPairs.isEmpty {
+                emptyState("arrow.left.arrow.right", "Nada que mostrar aquí todavía",
+                           (app.crossStats["pendientes"] ?? 0) > 0 ? "Pulsa «Contrastar vídeos» para cruzar lo que dicen los distintos canales."
+                                                                  : "No hay parejas de este tipo entre canales distintos.")
+            } else {
+                rows(app.shownPairs) { pair in
+                    VStack(alignment: .leading, spacing: 6) {
+                        if !pair.entity.isEmpty { Text(pair.entity.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(accent) }
+                        pairSide(pair.aText, pair.aFrom)
+                        Image(systemName: pair.relation == "contradicts" ? "arrow.up.arrow.down" : "equal")
+                            .font(.caption).foregroundStyle(pair.relation == "contradicts" ? Color.orange : accent)
+                        pairSide(pair.bText, pair.bFrom)
+                        if !pair.reason.isEmpty { Text(pair.reason).font(.caption).italic().foregroundStyle(.secondary) }
+                    }
+                }
             }
         }
     }
