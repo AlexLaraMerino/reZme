@@ -339,3 +339,27 @@ de **fuentes distintas**.
   pertinentes (con la contradicción a la vista cuando la hay); la décima,
   «riesgos de Nvidia», devuelve afirmaciones sobre Nvidia pero no riesgos.
 
+## 14. M5 · Calibración (esquema v8)
+
+- **Libro de previsiones** (`rezme/calibration.py`, tabla `forecasts`): una fila
+  por previsión verificada. La fecha objetivo sale del horizonte que dijo el
+  autor solo cuando es precisa («2027» → fin de 2027, «12 meses» → doce meses
+  tras publicarse); «largo plazo», «2027+» o «próximos años» quedan sin fecha.
+- **Resolver es cosa de una persona**: acertó, falló, a medias o no evaluable.
+  El modelo puede **sugerir** una resolución, pero solo con hechos o datos de la
+  propia base posteriores a la previsión, citándolos, y sin usar conocimiento
+  externo. Una sugerencia no puntúa hasta que alguien la acepta.
+- **Perfil de cada canal** (`source_profiles`): previsiones, resueltas, tasa de
+  acierto (las de «a medias» cuentan la mitad; sin resueltas no hay tasa, que no
+  es lo mismo que cero), tasa de verificación y afirmaciones apoyadas o
+  contradichas por otros canales. Los agentes lo reciben en `estado`, y el
+  resultado de cada previsión en `afirmacion`.
+- **Canales enteros**: la cola acepta la URL de un canal y encola sus vídeos más
+  recientes, hasta un máximo configurable.
+- **De principio a fin**: la cola puede transcribir y extraer en la misma
+  pasada, con el mismo tope de gasto.
+- Estado real al cerrar el hito: 225 previsiones, 42 con fecha, 1 vencida. Casi
+  todos los vídeos son de junio a septiembre de 2026 y sus previsiones son a
+  largo plazo o sin plazo, así que la calibración **aún no es medible**: el
+  mecanismo está, los datos llegarán con el tiempo.
+

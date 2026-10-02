@@ -6,9 +6,10 @@
 
 ## Qué hay en la app
 
-- **Cola:** pega una lista de reproducción o varias URLs y reZme guarda la transcripción de cada vídeo, uno a uno. Se puede pausar y continuar.
+- **Cola:** pega una lista de reproducción, un canal o varias URLs y reZme guarda la transcripción de cada vídeo, uno a uno; si lo marcas, extrae también sus afirmaciones en la misma pasada. Se puede pausar y continuar.
 - **Base de conocimiento:** los vídeos guardados, el botón para extraer sus afirmaciones con un modelo, los recuentos de la base y un buscador de afirmaciones verificadas.
 - **Contraste:** cruza lo que dicen los distintos canales sobre una misma entidad y muestra qué afirmaciones coinciden, cuáles se contradicen y cuáles se matizan. Cada afirmación indica cuántos canales independientes la sostienen o la contradicen; dos vídeos del mismo canal no cuentan como fuentes distintas. El buscador admite una fecha para ver solo lo que ya se sabía ese día.
+- **Calibración:** el libro de previsiones (qué dijo cada canal que iba a pasar, cuándo vence y si acertó) y el historial de cada canal. El resultado de una previsión lo anotas tú; el modelo puede sugerirlo a partir de hechos posteriores de la propia base.
 - **Limpieza:** propone fusionar las entidades que son la misma cosa con distinto nombre (en dos idiomas, con siglas, en plural) y retira afirmaciones repetidas. Nada se fusiona sin que lo apruebes, y antes se guarda una copia de la base.
 - **Agentes:** el bloque de configuración para conectar un agente a la base por MCP, un probador que muestra lo que recibiría para una pregunta y el registro de lo que los agentes han usado. Los agentes solo pueden leer.
 - **Informe rápido:** el esquema, la tesis y los highlights de un solo vídeo, con las dos opciones de abajo.

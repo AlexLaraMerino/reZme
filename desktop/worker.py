@@ -426,7 +426,8 @@ def run_queue(options):
             if urls:
                 emit("progress", message="Leyendo los vídeos de la lista…")
                 # En la app, una URL con `list=` significa la lista entera.
-                report = batch.add_urls(store, urls, whole_playlist=True, cookies_from=cookies)
+                report = batch.add_urls(store, urls, whole_playlist=True, cookies_from=cookies,
+                                        channel_limit=int(_number(options, "channel_limit") or 50))
                 if report.invalid and not (report.added or report.already):
                     raise ValueError("Introduce una URL válida de YouTube (vídeo o lista).")
                 message = f"{report.added} vídeos añadidos · {report.already} ya estaban"
@@ -437,11 +438,36 @@ def run_queue(options):
                 store.retry_jobs(status="skipped")
             store.recover_running_jobs()
             emit_queue(store)
+            deps, stage, spent = batch.Deps(), "ingest", None
+            if options.get("extract"):  # de principio a fin: transcribir y extraer cada vídeo
+                from rezme import extract
+                backend, spent, current = extraction_backend(options)
+                try:
+                    workers = min(max(int(options.get("workers") or 1), 1), 4)
+                except ValueError:
+                    workers = 1
+
+                def extractor(target, source_id):
+                    title = (target.get_source_by_id(source_id) or {}).get("title") or "Vídeo"
+                    current["label"] = title
+                    try:
+                        return extract.extract_source(
+                            target, source_id, backend, workers=workers,
+                            progress=lambda message: progress(f"{title} · {message.strip().rstrip('…')}"))
+                    finally:
+                        current["label"] = ""
+                deps.extractor, stage = extractor, "all"
             summary = batch.run_queue(
-                store, no_whisper=not whisper, cookies_from=cookies, out=progress,
+                store, stage=stage, no_whisper=not whisper, cookies_from=cookies, deps=deps, out=progress,
                 on_change=lambda: emit_queue(store))
             emit_queue(store)
-            emit("done", message=batch.format_summary(summary))
+            if spent and spent["reached"]:
+                emit("done", message=f"Tope de gasto alcanzado ({spent['cost']:.2f} $). Lo hecho se conserva y el resto sigue en cola.")
+                return
+            if summary.stopped:
+                raise RuntimeError(f"Proceso detenido: {summary.stopped}")
+            emit("done", message=batch.format_summary(summary)
+                 + (f" · gasto de la tanda {spent['cost']:.2f} $" if spent else ""))
             return
         emit_queue(store)
 
@@ -651,6 +677,82 @@ def run_cross(options):
         emit_cross(store)
 
 
+RESOLUTION_TEXT = {"pending": "Sin resolver", "correct": "Acertó", "incorrect": "Falló",
+                   "partial": "A medias", "void": "No evaluable"}
+
+
+def emit_calibration(store):
+    from rezme import calibration
+    forecasts = []
+    for item in calibration.list_forecasts(store):
+        suggestion = item["suggestion"]
+        forecasts.append({
+            "id": item["claim_id"], "text": item["statement"], "channel": item["channel"] or "",
+            "title": item["source_title"] or "", "entity": item["entity"] or "",
+            "published": (item["published_at"] or "")[:10], "target": item["target_date"] or "",
+            "horizon": item["horizon_text"] or "", "resolution": item["resolution"],
+            "label": RESOLUTION_TEXT[item["resolution"]], "due": item["due"], "notes": item["notes"] or "",
+            "suggestion": RESOLUTION_TEXT[suggestion["resolution"]] if suggestion else "",
+            "suggested": suggestion["resolution"] if suggestion else "",
+            "suggestion_reason": suggestion["reason"] if suggestion else ""})
+    profiles = [{"channel": p["channel"], "videos": p["videos"], "verified": p["verified"],
+                 "forecasts": p["forecasts"], "resolved": p["resolved"], "due": p["due"],
+                 "hit_rate": p["hit_rate"], "supported": p["supported"], "contradicted": p["contradicted"],
+                 "durable": p["durable"]} for p in calibration.channel_profiles(store)]
+    pending = len(calibration.suggestion_batches(store))
+    emit("calibration", forecasts=forecasts, profiles=profiles, suggestable=pending)
+
+
+def run_calibration(options):
+    """Previsiones y perfil de los canales desde la app."""
+    from rezme import Store, backends, calibration
+
+    action = options.get("action", "status")
+    if action not in ("status", "resolve", "suggest"):
+        raise ValueError("Acción de calibración no válida.")
+    if not options.get("db"):
+        raise ValueError("No se encuentra la base de datos de reZme.")
+    with Store(options["db"]) as store:
+        calibration.sync_forecasts(store)
+        if action == "resolve":
+            if not str(options.get("id") or "").isdigit():
+                raise ValueError("Falta la previsión.")
+            claim_id = int(options["id"])
+            resolution = options.get("resolution") or ""
+            evidence = None
+            if options.get("accept"):  # se acepta la sugerencia del modelo, con su evidencia
+                row = next((f for f in calibration.list_forecasts(store) if f["claim_id"] == claim_id), None)
+                if row is None or not row["suggestion"]:
+                    raise ValueError("Esa previsión no tiene ninguna sugerencia.")
+                resolution = row["suggestion"]["resolution"]
+                evidence = row["suggestion"]["evidence"]
+                notes = "Sugerida por el modelo y aceptada: " + row["suggestion"]["reason"]
+            else:
+                notes = options.get("notes")
+            calibration.resolve(store, claim_id, resolution, notes=notes, evidence=evidence)
+        elif action == "suggest":
+            backend, spent, _ = extraction_backend(options)
+            try:
+                workers = min(max(int(options.get("workers") or 1), 1), 4)
+            except ValueError:
+                workers = 1
+            try:
+                result = calibration.suggest(store, backend.call, workers=workers,
+                                             progress=lambda message: emit("progress", message=message))
+            except backends.BudgetExceeded:
+                emit_calibration(store)
+                emit("done", message=f"Tope de gasto alcanzado ({spent['cost']:.2f} $).")
+                return
+            except backends.BackendUnavailable as error:
+                emit_calibration(store)
+                raise RuntimeError(f"Revisión detenida: {error}") from None
+            emit_calibration(store)
+            emit("done", message=f"{result['entidades']} entidades revisadas · {result['sugerencias']} sugerencias "
+                                 f"de resolución para que las confirmes · gasto {spent['cost']:.3f} $")
+            return
+        emit_calibration(store)
+
+
 def run_agents(options):
     """Pantalla de agentes: cómo conectarlos, qué recibirían para una pregunta y qué han usado."""
     from rezme import Store, agents, mcp
@@ -771,6 +873,8 @@ if __name__ == "__main__":
             run_cross(options)
         elif options.get("mode") == "agents":
             run_agents(options)
+        elif options.get("mode") == "calibration":
+            run_calibration(options)
         else:
             run(options)
     except Exception as error:

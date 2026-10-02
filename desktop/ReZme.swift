@@ -35,7 +35,37 @@ enum KeyStore {
     static func delete() { SecItemDelete(query as CFDictionary) }
 }
 
-enum Pane: Hashable { case queue, library, contrast, cleanup, agents, report, settings }
+enum Pane: Hashable { case queue, library, contrast, calibration, cleanup, agents, report, settings }
+
+/// Una previsión del libro: qué se dijo, cuándo vence y si ya se sabe si acertó.
+struct Forecast: Identifiable {
+    let id: Int
+    let text: String
+    let origin: String
+    let published: String
+    let target: String
+    let horizon: String
+    let resolution: String
+    let label: String
+    let due: Bool
+    let notes: String
+    let suggestion: String
+    let suggestionReason: String
+}
+
+/// Historial de un canal.
+struct ChannelProfile: Identifiable {
+    var id: String { channel }
+    let channel: String
+    let videos: Int
+    let verified: Int
+    let forecasts: Int
+    let resolved: Int
+    let due: Int
+    let hitRate: Double?
+    let supported: Int
+    let contradicted: Int
+}
 
 /// Uso que un agente ha anotado: qué afirmaciones empleó y para qué.
 struct AgentUse: Identifiable {
@@ -177,6 +207,34 @@ final class AppModel: ObservableObject {
     @Published var stats: [String: Int] = [:]
     @Published var query = ""
     @Published var hits: [ClaimHit]? = nil
+    // Calibración
+    @Published var forecasts: [Forecast] = []
+    @Published var profiles: [ChannelProfile] = []
+    @Published var suggestable = 0
+    @Published var forecastFilter = "due"
+    /// Al procesar la cola, extraer también las afirmaciones de cada vídeo.
+    @Published var autoExtract: Bool { didSet { defaults.set(autoExtract, forKey: "autoExtract") } }
+    /// De un canal, cuántos vídeos recientes se encolan (0 = todos).
+    @Published var channelLimit: Int { didSet { defaults.set(channelLimit, forKey: "channelLimit") } }
+    var shownForecasts: [Forecast] {
+        switch forecastFilter {
+        case "due": return forecasts.filter { $0.due }
+        case "suggested": return forecasts.filter { !$0.suggestion.isEmpty }
+        case "dated": return forecasts.filter { !$0.target.isEmpty && $0.resolution == "pending" }
+        case "resolved": return forecasts.filter { $0.resolution != "pending" }
+        default: return forecasts
+        }
+    }
+    func forecastCount(_ filter: String) -> Int {
+        switch filter {
+        case "due": return forecasts.filter { $0.due }.count
+        case "suggested": return forecasts.filter { !$0.suggestion.isEmpty }.count
+        case "dated": return forecasts.filter { !$0.target.isEmpty && $0.resolution == "pending" }.count
+        case "resolved": return forecasts.filter { $0.resolution != "pending" }.count
+        default: return forecasts.count
+        }
+    }
+
     // Agentes
     @Published var agentConfig = ""
     @Published var agentTools: [String] = []
@@ -249,6 +307,8 @@ final class AppModel: ObservableObject {
         budget = defaults.string(forKey: "budget") ?? "5"
         reasoning = defaults.string(forKey: "reasoning") ?? "low"
         workers = defaults.object(forKey: "workers") as? Int ?? 2
+        autoExtract = defaults.bool(forKey: "autoExtract")
+        channelLimit = defaults.object(forKey: "channelLimit") as? Int ?? 50
         priceIn = defaults.string(forKey: "priceIn") ?? ""
         priceOut = defaults.string(forKey: "priceOut") ?? ""
     }
@@ -395,7 +455,10 @@ final class AppModel: ObservableObject {
     func cancel() {
         let owner = busy
         generation = UUID(); process?.terminate(); process = nil; busy = nil; error = false
-        if owner == .contrast {
+        if owner == .calibration {
+            status = "Revisión en pausa."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.calibration("status") }
+        } else if owner == .contrast {
             status = "Contraste en pausa. Lo ya contrastado se conserva."
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.cross("status") }
         } else if owner == .queue || owner == .library {
@@ -411,12 +474,19 @@ final class AppModel: ObservableObject {
     /// `run` añade las URLs y procesa la cola; `status`, `retry` y `clear` la gestionan.
     func queue(_ action: String) {
         let tracked = action == "run"
+        var payload = ["mode": "queue", "action": action, "urls": queueText, "browser": browser,
+                       "whisper": whisper ? "1" : "", "db": database.path, "channel_limit": String(channelLimit)]
         if tracked {
             guard busy == nil else { return }
-            error = false; status = "Preparando la cola…"
+            error = false
+            if autoExtract {
+                guard let model = modelPayload() else { return }
+                payload.merge(model) { _, new in new }
+                payload["extract"] = "1"
+            }
+            status = "Preparando la cola…"
         }
-        launch(["mode": "queue", "action": action, "urls": queueText, "browser": browser,
-                "whisper": whisper ? "1" : "", "db": database.path],
+        launch(payload,
                owner: tracked ? .queue : nil,
                onEvent: { event in self.queueEvent(event) },
                onExit: { ok in
@@ -572,6 +642,71 @@ final class AppModel: ObservableObject {
         } else {
             status = "La base se creará al guardar el primer vídeo."; error = false
         }
+    }
+
+    /// Datos del modelo para una tarea que lo usa, o nil (con aviso) si falta la clave, el precio o el tope.
+    func modelPayload() -> [String: String]? {
+        if engine == "meta" {
+            loadKey()
+            if key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                pane = .settings; fail("Introduce tu clave de Meta en los ajustes, o elige Claude Code como motor."); return nil
+            }
+            if !hasPrices {
+                pane = .settings; fail("Introduce en los ajustes el precio por millón de tokens de tu modelo: sin él no se puede aplicar el tope de gasto."); return nil
+            }
+            saveKey()
+        }
+        if budgetValue <= 0 { pane = .settings; fail("Fija en los ajustes un tope de gasto por tanda."); return nil }
+        return ["engine": engine, "key": engine == "meta" ? key.trimmingCharacters(in: .whitespacesAndNewlines) : "",
+                "model": model, "budget": String(budgetValue), "price_in": String(number(priceIn)),
+                "price_out": String(number(priceOut)), "reasoning": reasoning, "workers": String(workers)]
+    }
+
+    // MARK: Calibración
+
+    /// `status` trae el libro de previsiones y el historial de canales; `resolve` anota un resultado
+    /// (o acepta la sugerencia del modelo); `suggest` pide sugerencias al modelo.
+    func calibration(_ action: String, id: Int? = nil, resolution: String = "", accept: Bool = false) {
+        let tracked = action == "suggest"
+        var payload = ["mode": "calibration", "action": action, "db": database.path]
+        if let id { payload["id"] = String(id) }
+        if !resolution.isEmpty { payload["resolution"] = resolution }
+        if accept { payload["accept"] = "1" }
+        if tracked {
+            guard busy == nil else { status = "Hay una tarea en curso. Espera a que termine o páusala."; error = true; return }
+            error = false
+            guard let model = modelPayload() else { return }
+            payload.merge(model) { _, new in new }
+        }
+        let started = launch(payload, owner: tracked ? .calibration : nil, onEvent: { event in
+            switch event["type"] as? String {
+            case "progress", "done": self.status = event["message"] as? String ?? ""
+            case "error": self.fail(event["message"] as? String ?? "No se pudo completar.")
+            case "calibration":
+                self.suggestable = event["suggestable"] as? Int ?? 0
+                self.forecasts = (event["forecasts"] as? [[String: Any]] ?? []).compactMap { item in
+                    guard let id = item["id"] as? Int else { return nil }
+                    let origin = [item["channel"] as? String ?? "", item["title"] as? String ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
+                    return Forecast(id: id, text: item["text"] as? String ?? "", origin: origin,
+                                    published: item["published"] as? String ?? "", target: item["target"] as? String ?? "",
+                                    horizon: item["horizon"] as? String ?? "", resolution: item["resolution"] as? String ?? "pending",
+                                    label: item["label"] as? String ?? "", due: item["due"] as? Bool ?? false,
+                                    notes: item["notes"] as? String ?? "", suggestion: item["suggestion"] as? String ?? "",
+                                    suggestionReason: item["suggestion_reason"] as? String ?? "")
+                }
+                self.profiles = (event["profiles"] as? [[String: Any]] ?? []).map { item in
+                    ChannelProfile(channel: item["channel"] as? String ?? "", videos: item["videos"] as? Int ?? 0,
+                                   verified: item["verified"] as? Int ?? 0, forecasts: item["forecasts"] as? Int ?? 0,
+                                   resolved: item["resolved"] as? Int ?? 0, due: item["due"] as? Int ?? 0,
+                                   hitRate: item["hit_rate"] as? Double, supported: item["supported"] as? Int ?? 0,
+                                   contradicted: item["contradicted"] as? Int ?? 0)
+                }
+            default: break
+            }
+        }, onExit: { ok in
+            if tracked && !ok && !self.error { self.fail("La revisión se ha interrumpido. Puedes volver a lanzarla.") }
+        })
+        if started && tracked { status = "Buscando en la base hechos posteriores que resuelvan previsiones…" }
     }
 
     // MARK: Agentes
@@ -817,6 +952,7 @@ struct ContentView: View {
                     case .queue: queuePane
                     case .library: libraryPane
                     case .report: reportPane
+                    case .calibration: calibrationPane
                     case .agents: agentsPane
                     case .contrast: contrastPane
                     case .cleanup: cleanupPane
@@ -846,6 +982,7 @@ struct ContentView: View {
             navItem(.queue, "Cola", "tray.and.arrow.down", badge: app.waiting)
             navItem(.library, "Base de conocimiento", "cylinder.split.1x2", badge: 0)
             navItem(.contrast, "Contraste", "arrow.left.arrow.right", badge: 0)
+            navItem(.calibration, "Calibración", "scope", badge: app.forecastCount("due"))
             navItem(.cleanup, "Limpieza", "wand.and.stars", badge: app.proposals.count)
             navItem(.agents, "Agentes", "cpu", badge: 0)
             navItem(.report, "Informe rápido", "doc.text", badge: 0)
@@ -867,6 +1004,7 @@ struct ContentView: View {
             if pane == .cleanup && app.busy == nil { app.catalog("status") }
             if pane == .contrast && app.busy != .contrast { app.cross("status") }
             if pane == .agents { app.agents("status") }
+            if pane == .calibration && app.busy != .calibration { app.calibration("status") }
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon).frame(width: 20)
@@ -939,19 +1077,21 @@ struct ContentView: View {
 
     var queuePane: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header("Cola de vídeos", "Pega una lista de reproducción o varias URLs. reZme guarda la transcripción de cada vídeo en tu base.")
+            header("Cola de vídeos", "Pega una lista de reproducción, un canal o varias URLs. reZme guarda la transcripción de cada vídeo en tu base.")
             VStack(alignment: .leading, spacing: 10) {
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $app.queueText).font(.system(size: 12)).scrollContentBackground(.hidden).frame(height: 58)
                     if app.queueText.isEmpty {
-                        Text(verbatim: "https://www.youtube.com/playlist?list=…  ·  una URL por línea")
+                        Text(verbatim: "Lista, canal (youtube.com/@nombre) o vídeos  ·  una URL por línea")
                             .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.leading, 5).allowsHitTesting(false)
                     }
                 }
                 Divider()
                 HStack {
-                    Toggle("Transcribir con Whisper los vídeos sin subtítulos", isOn: $app.whisper)
-                        .toggleStyle(.checkbox).font(.caption).disabled(app.busy == .queue)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Transcribir con Whisper los vídeos sin subtítulos", isOn: $app.whisper)
+                        Toggle("Extraer también las afirmaciones de cada vídeo (usa el modelo, con el tope de gasto)", isOn: $app.autoExtract)
+                    }.toggleStyle(.checkbox).font(.caption).disabled(app.busy == .queue)
                     Spacer()
                     if app.busy == .queue {
                         Button("Pausar", action: app.cancel)
@@ -1307,6 +1447,105 @@ struct ContentView: View {
         }
     }
 
+    // MARK: Calibración
+
+    func percent(_ value: Double?) -> String { value.map { "\(Int(($0 * 100).rounded())) %" } ?? "—" }
+
+    func forecastDetail(_ forecast: Forecast) -> String {
+        var parts = [forecast.origin, "dicho el \(forecast.published)"]
+        if !forecast.target.isEmpty { parts.append("vence el \(forecast.target)") }
+        else if !forecast.horizon.isEmpty { parts.append("sin fecha (\(forecast.horizon))") }
+        else { parts.append("sin fecha") }
+        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    var calibrationPane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header("Calibración", "Qué previsiones ha hecho cada canal y cuáles se han cumplido. El resultado lo decides tú; el modelo solo sugiere.")
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("CANAL").frame(maxWidth: .infinity, alignment: .leading)
+                    ForEach(["VÍDEOS", "PREVISIONES", "RESUELTAS", "ACIERTO", "APOYADAS", "CONTRADICHAS"], id: \.self) { Text($0).frame(width: 92, alignment: .trailing) }
+                }.font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.bottom, 5)
+                ForEach(app.profiles) { profile in
+                    HStack {
+                        Text(profile.channel).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                        Text("\(profile.videos)").frame(width: 92, alignment: .trailing)
+                        Text("\(profile.forecasts)").frame(width: 92, alignment: .trailing)
+                        Text("\(profile.resolved)").frame(width: 92, alignment: .trailing)
+                        Text(percent(profile.hitRate)).fontWeight(.semibold).foregroundStyle(profile.hitRate == nil ? Color.secondary : accent)
+                            .frame(width: 92, alignment: .trailing)
+                        Text("\(profile.supported)").frame(width: 92, alignment: .trailing)
+                        Text("\(profile.contradicted)").frame(width: 92, alignment: .trailing)
+                    }.font(.callout).padding(.vertical, 4)
+                    Divider().opacity(0.5)
+                }
+                Text("Acierto = previsiones acertadas (las de «a medias» cuentan la mitad) sobre las resueltas. «—» significa que aún no hay ninguna resuelta, no un cero. Apoyadas y contradichas: afirmaciones del canal que otro canal sostiene o contradice.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.top, 7)
+            }
+            .padding(13).background(panel, in: RoundedRectangle(cornerRadius: 12)).padding(.bottom, 12)
+
+            HStack(spacing: 12) {
+                Image(systemName: "scope").font(.title3).foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(app.busy == .calibration ? "Revisando con \(app.engineName)…"
+                         : app.suggestable == 0 ? "No hay previsiones que el modelo pueda revisar ahora."
+                         : "\(app.suggestable) entidades tienen previsiones y hechos posteriores que podrían resolverlas")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("El modelo busca en tu base hechos posteriores a cada previsión y sugiere si acertó. No usa nada de fuera, y una sugerencia no cuenta hasta que la aceptas.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if app.busy == .calibration {
+                    ProgressView().controlSize(.small)
+                    Button("Pausar", action: app.cancel)
+                } else {
+                    Button { app.calibration("suggest") } label: { Label("Sugerir resoluciones", systemImage: "arrow.right").padding(.horizontal, 4) }
+                        .buttonStyle(.borderedProminent).tint(accent).disabled(app.busy != nil || app.suggestable == 0)
+                }
+            }
+            .padding(13).background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12)).padding(.bottom, 12)
+
+            Picker("", selection: $app.forecastFilter) {
+                Text("Vencidas (\(app.forecastCount("due")))").tag("due")
+                Text("Con sugerencia (\(app.forecastCount("suggested")))").tag("suggested")
+                Text("Con fecha (\(app.forecastCount("dated")))").tag("dated")
+                Text("Resueltas (\(app.forecastCount("resolved")))").tag("resolved")
+                Text("Todas (\(app.forecastCount("all")))").tag("all")
+            }.pickerStyle(.segmented).labelsHidden().fixedSize().padding(.bottom, 8)
+
+            if app.shownForecasts.isEmpty {
+                emptyState("scope", "Nada en esta lista", app.forecastFilter == "due" ? "Ninguna previsión con fecha ha vencido sin resolver.\nLa mayoría son a largo plazo o no dicen cuándo." : "No hay previsiones de este tipo.")
+            } else {
+                rows(app.shownForecasts) { forecast in
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(forecast.text).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            Text(forecastDetail(forecast)).font(.caption).foregroundStyle(forecast.due ? Color.orange : Color.secondary).lineLimit(1)
+                            if !forecast.suggestion.isEmpty {
+                                HStack(spacing: 8) {
+                                    Label("El modelo sugiere «\(forecast.suggestion)»: \(forecast.suggestionReason)", systemImage: "sparkle")
+                                        .font(.caption).foregroundStyle(accent).fixedSize(horizontal: false, vertical: true)
+                                    Button("Aceptar") { app.calibration("resolve", id: forecast.id, accept: true) }.controlSize(.small)
+                                }
+                            }
+                            if !forecast.notes.isEmpty { Text(forecast.notes).font(.caption).italic().foregroundStyle(.secondary) }
+                        }
+                        Spacer()
+                        Menu(forecast.label) {
+                            Button("Acertó") { app.calibration("resolve", id: forecast.id, resolution: "correct") }
+                            Button("Falló") { app.calibration("resolve", id: forecast.id, resolution: "incorrect") }
+                            Button("A medias") { app.calibration("resolve", id: forecast.id, resolution: "partial") }
+                            Button("No evaluable") { app.calibration("resolve", id: forecast.id, resolution: "void") }
+                            Divider()
+                            Button("Sin resolver") { app.calibration("resolve", id: forecast.id, resolution: "pending") }
+                        }.fixedSize().disabled(app.busy == .calibration)
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: Agentes
 
     var agentsPane: some View {
@@ -1573,6 +1812,15 @@ struct ContentView: View {
                         Text("Chrome").tag("chrome")
                         Text("Firefox").tag("firefox")
                         Text("Safari").tag("safari")
+                    }.labelsHidden().fixedSize()
+                }
+                setting("Canales", "Al pegar un canal en la cola se encolan sus vídeos más recientes, hasta este máximo.") {
+                    Picker("", selection: $app.channelLimit) {
+                        Text("25 vídeos").tag(25)
+                        Text("50 vídeos").tag(50)
+                        Text("100 vídeos").tag(100)
+                        Text("200 vídeos").tag(200)
+                        Text("Todos").tag(0)
                     }.labelsHidden().fixedSize()
                 }
                 setting("Vídeos sin subtítulos", "Whisper transcribe el audio en tu Mac. Con vídeos largos puede tardar horas; si lo desactivas, quedan marcados para después.") {

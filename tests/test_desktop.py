@@ -526,6 +526,69 @@ class DesktopTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AAAA-MM-DD"):
                 hits(known_at="ayer")
 
+    def test_calibration_from_the_app(self):
+        import os, tempfile
+        from rezme import Claim, Store
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "rezme.db")
+            with Store(db) as store:
+                vic, _ = store.add_source("youtube", "aaaaaaaaaa1", title="Vídeo de junio", channel="Vic",
+                                          channel_id="VIC", published_at="2026-06-07")
+                pod, _ = store.add_source("youtube", "bbbbbbbbbb2", title="Vídeo de septiembre", channel="Pod",
+                                          channel_id="POD", published_at="2026-09-18")
+                fed = store.upsert_entity("central_bank", "Reserva Federal")
+                hike, _ = store.add_claim(Claim(source_id=vic, statement="La Fed subirá los tipos en septiembre.",
+                                                type="forecast", status="verified", entity_id=fed, horizon="2026-09"))
+                gold, _ = store.add_claim(Claim(source_id=vic, statement="El oro caerá.", type="forecast",
+                                                status="verified", horizon="largo plazo"))
+                fact, _ = store.add_claim(Claim(source_id=pod, statement="La Fed subió 25 puntos básicos.",
+                                                type="fact", status="verified", entity_id=fed))
+            run = lambda **options: self._run(worker.run_calibration, dict(db=db, **options))
+            first = run()[-1]
+            rows = {f["id"]: f for f in first["forecasts"]}
+            self.assertEqual((rows[hike]["target"], rows[hike]["due"], rows[hike]["label"], rows[gold]["target"]),
+                             ("2026-09-30", True, "Sin resolver", ""))
+            self.assertEqual((first["suggestable"], first["profiles"][0]["hit_rate"]), (1, None))
+
+            answer = json.dumps({"resolutions": [{"id": hike, "resolution": "correct", "evidence": [fact], "reason": "subió"}]})
+            with patch.object(worker, "call_meta_extract", return_value=answer) as call:
+                events = run(action="suggest", engine="meta", key="secret-test", model="m", price_in="1", price_out="1")
+            self.assertIn("No uses tu conocimiento del mundo", call.call_args.args[0])
+            self.assertNotIn("secret-test", json.dumps(events))
+            self.assertIn("1 sugerencias de resolución", events[-1]["message"])
+            row = {f["id"]: f for f in events[-2]["forecasts"]}[hike]
+            self.assertEqual((row["resolution"], row["suggestion"], row["suggestion_reason"]), ("pending", "Acertó", "subió"))
+
+            accepted = {f["id"]: f for f in run(action="resolve", id=str(hike), accept="1")[-1]["forecasts"]}[hike]
+            self.assertEqual((accepted["resolution"], accepted["suggestion"]), ("correct", ""))
+            self.assertIn("Sugerida por el modelo y aceptada: subió", accepted["notes"])
+            done = run(action="resolve", id=str(gold), resolution="void", notes="demasiado vaga")[-1]
+            vic_profile = next(p for p in done["profiles"] if p["channel"] == "Vic")
+            self.assertEqual((vic_profile["resolved"], vic_profile["hit_rate"]), (1, 1.0))
+            for bad in (dict(action="resolve", id=str(gold), resolution="quizá"), dict(action="resolve", id="x"),
+                        dict(action="resolve", id=str(gold), accept="1"), dict(action="borrar")):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    run(**bad)
+
+    def test_queue_can_transcribe_and_extract_in_one_go(self):
+        import tempfile
+        from rezme import Store, batch
+        answer = json.dumps({"entities": [], "claims": [{"statement": "Idea.", "type": "fact", "quote": "hola a todos los que veis"}]})
+        fetch = lambda url, langs, tmp, cookies: ({"title": "Vídeo", "automatic_captions": {"es": [{"ext": "json3", "url": "u"}]}},
+                                                  [(0, "hola a todos los que veis el canal")])
+        deps = batch.Deps(fetch=fetch, sleep=lambda s: None, clock=lambda: 0.0, uniform=lambda a, b: 0.0)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(batch, "Deps", lambda: deps), \
+                patch.object(worker, "call_meta_extract", return_value=answer) as call:
+            db = tmp + "/rezme.db"
+            events = self.queue(db, action="run", urls="https://youtu.be/aaaaaaaaaa1", extract="1", engine="meta",
+                                key="k", model="m", price_in="1", price_out="1", budget="5")
+            self.assertEqual(call.call_count, 1)
+            final = [e for e in events if e["type"] == "queue"][-1]["jobs"]
+            self.assertEqual([(j["state"], j["detail"]) for j in final], [("done", "1 afirmaciones verificadas")])
+            self.assertIn("gasto de la tanda", events[-1]["message"])
+            with Store(db) as store:
+                self.assertEqual(store.stats()["claims_by_status"], {"verified": 1})
+
     def test_agents_pane_shows_config_answer_and_usage(self):
         import os, tempfile
         from rezme import Claim, Store, agents
