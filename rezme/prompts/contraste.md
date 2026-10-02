@@ -19,4 +19,4 @@ Devuelve solo JSON, sin texto adicional:
 
 {"relations": [{"a": 123, "b": 456, "relation": "contradicts", "reason": "A sostiene que la capacidad basta para banda ancha y B calcula que no"}]}
 
-`a` y `b` son `id` de la lista. `reason` es una frase corta en español que explique la relación.
+`a` y `b` son `id` de la lista. `reason` es una frase corta en español que explique la relación. En `reason` no uses las letras de canal ni los `id` (quien lo lea no los verá): di «una» y «la otra», o nombra de qué trata cada una.

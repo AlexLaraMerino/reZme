@@ -1,4 +1,4 @@
-"""CLI de reZme fase 2:  python -m rezme {ingest,extract,claims,eval,queue,stats,search} ..."""
+"""CLI de reZme fase 2:  python -m rezme {ingest,extract,claims,eval,queue,mcp,ask,stats,search} ..."""
 from __future__ import annotations
 
 import argparse
@@ -339,6 +339,28 @@ def cmd_queue_clear(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Servidor MCP por la entrada y la salida estándar. Todo aviso va a stderr: stdout es el protocolo."""
+    from .mcp import Server
+
+    Server(db_path(args.db)).serve()
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    from . import agents
+
+    try:
+        with Store(db_path(args.db), readonly=True) as store:
+            pack = agents.context_pack(store, args.question, max_tokens=args.max_tokens, a_fecha=args.as_of)
+    except (ValueError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(pack["texto"])
+    print(f"\n[{len(pack['ids'])} afirmaciones · ~{pack['tokens_estimados']} tokens]", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="rezme", description="Base de conocimiento de reZme (fase 2).")
     p.add_argument("--db", help="Ruta de la base SQLite (o variable REZME_DB)")
@@ -441,6 +463,17 @@ def main(argv: list[str] | None = None) -> int:
     qc = qsub.add_parser("clear", parents=[common], help="Limpiar trabajos terminados")
     qc.add_argument("--done", action="store_true")
     qc.set_defaults(func=cmd_queue_clear)
+
+    m = sub.add_parser("mcp", parents=[common],
+                       help="Servidor MCP de solo lectura para agentes (stdio)")
+    m.set_defaults(func=cmd_mcp)
+
+    k = sub.add_parser("ask", parents=[common],
+                       help="Muestra el contexto que recibiría un agente para una pregunta")
+    k.add_argument("question")
+    k.add_argument("--max-tokens", type=int, default=3000)
+    k.add_argument("--as-of", metavar="AAAA-MM-DD", help="Solo lo que se sabía ese día")
+    k.set_defaults(func=cmd_ask)
 
     s = sub.add_parser("stats", parents=[common], help="Recuento de registros")
     s.set_defaults(func=cmd_stats)

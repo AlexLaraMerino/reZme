@@ -285,6 +285,16 @@ _JOB_FIELDS = frozenset({"status", "stage", "attempts", "last_error", "priority"
                          "finished_at", "notes", "title"})
 
 
+# Palabras que no ayudan a encontrar nada (español e inglés).
+_STOPWORDS = frozenset("""a al algo como con cual cuales cuando cuanto de del donde el en es esta estan este
+    esto fue ha han hay la las le les lo los mas me mi muy no o para pero por que se ser si sin sobre
+    son su sus tambien te tiene tienen un una unas uno unos y ya about an and are as at be by do does
+    for from how in is it its of on or that the this to was what when where which who why will
+    with""".split())
+_DURABLE_TYPES = frozenset({"mechanism", "mental_model", "heuristic", "framework", "causal_claim",
+                            "historical_case"})
+
+
 def _fts_query(text: str) -> str:
     """Convierte texto libre en una consulta FTS5 segura (todas las palabras)."""
     tokens = re.findall(r"\w+", text, flags=re.UNICODE)
@@ -307,8 +317,23 @@ def _claim(row: sqlite3.Row) -> dict[str, Any]:
 
 
 class Store:
-    def __init__(self, path: str | Path = ":memory:"):
+    def __init__(self, path: str | Path = ":memory:", *, readonly: bool = False):
+        """Con `readonly` la base se abre sin posibilidad de escribir (interfaz de agentes)."""
         self.path = str(path)
+        self.readonly = readonly
+        if readonly:
+            if self.path == ":memory:" or not Path(self.path).is_file():
+                raise RuntimeError("No existe la base de conocimiento. Abre reZme y procesa algún vídeo.")
+            self.db = sqlite3.connect(f"file:{Path(self.path).resolve().as_posix()}?mode=ro", uri=True)
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA query_only = ON")
+            version = self.db.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                self.db.close()
+                raise RuntimeError(
+                    f"La base tiene esquema v{version} y esta versión usa v{SCHEMA_VERSION}. "
+                    "Abre reZme una vez para actualizarla.")
+            return
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path)
@@ -1043,6 +1068,103 @@ class Store:
         sql += "WHERE " + " AND ".join(where) + f" {order} LIMIT ?"
         params.append(int(limit))
         return [_claim(row) for row in self.db.execute(sql, params)]
+
+    # -- consulta para agentes: orden por relevancia -------------------------
+
+    def entities_in(self, text: str) -> list[int]:
+        """Entidades cuyo nombre o alias aparece en el texto (como palabra o frase completa)."""
+        haystack = f" {normalize_name(text)} "
+        found: dict[int, None] = {}
+        rows = self.db.execute(
+            """SELECT id, norm_name AS name FROM entities
+               UNION ALL SELECT entity_id, norm_alias FROM entity_aliases""")
+        for row in rows:
+            if len(row["name"]) >= 2 and f" {row['name']} " in haystack:
+                found[row["id"]] = None
+        return list(found)
+
+    def search_ranked(self, query: str, *, entity_id: int | None = None, type: str | None = None,
+                      tag: str | None = None, domain: str | None = None,
+                      known_at: str | None = None, include_expired: bool = False,
+                      min_supported: int = 0, limit: int = 20) -> list[dict[str, Any]]:
+        """Afirmaciones verificadas ordenadas por relevancia para una pregunta en lenguaje natural.
+
+        A diferencia de `search_claims`, no exige todas las palabras: combina la coincidencia
+        de texto (título, enunciado y cita, con prefijos) con las entidades que nombra la
+        pregunta, y premia la cobertura de la pregunta, el respaldo de otros canales y el
+        conocimiento que dura. Devuelve cada afirmación con su `score`.
+        """
+        now = known_at or utc_now()
+        tokens = [t for t in dict.fromkeys(normalize_name(query).split())
+                  if t not in _STOPWORDS and (len(t) > 1 or t.isdigit())]
+        mentioned = set(self.entities_in(query))
+        where, params = ["c.status = 'verified'"], []  # type: list[str], list[Any]
+        for column, value in (("c.entity_id", entity_id), ("c.type", type), ("c.domain", domain)):
+            if value is not None:
+                where.append(f"{column} = ?")
+                params.append(value)
+        if tag:
+            where.append("c.tags_json LIKE ?")
+            params.append(f'%"{tag}"%')
+        if known_at:
+            where.append("COALESCE(c.published_at, c.captured_at) <= ?")
+            params.append(known_at)
+        if not include_expired:
+            where.append("(c.expires_at IS NULL OR c.expires_at > ?)")
+            params.append(now)
+        filters = " AND ".join(where)
+        pool = max(limit * 6, 60)
+        candidates: dict[int, dict[str, Any]] = {}
+        if tokens:
+            match = " OR ".join(f'"{t}"*' for t in tokens)
+            sql = (_CLAIM_SELECT + ", bm25(claims_fts, 4.0, 2.0, 1.0) AS rank FROM claims_fts "
+                   "JOIN claims c ON c.id = claims_fts.rowid " + _CLAIM_JOINS
+                   + f"WHERE claims_fts MATCH ? AND {filters} ORDER BY rank LIMIT ?")
+            for row in self.db.execute(sql, (match, *params, pool)):
+                item = _claim(row)
+                item["text_score"] = -item.pop("rank")
+                candidates[item["id"]] = item
+        for entity in mentioned if entity_id is None else ():
+            sql = (_CLAIM_SELECT + "FROM claims c " + _CLAIM_JOINS
+                   + f"WHERE c.entity_id = ? AND {filters} ORDER BY c.id DESC LIMIT ?")
+            for row in self.db.execute(sql, (entity, *params, pool // 2)):
+                item = _claim(row)
+                candidates.setdefault(item["id"], {**item, "text_score": 0.0})
+        if not tokens and not mentioned:
+            sql = (_CLAIM_SELECT + "FROM claims c " + _CLAIM_JOINS
+                   + f"WHERE {filters} ORDER BY c.id DESC LIMIT ?")
+            for row in self.db.execute(sql, (*params, pool)):
+                item = _claim(row)
+                candidates[item["id"]] = {**item, "text_score": 0.0}
+
+        best = max((c["text_score"] for c in candidates.values()), default=0.0) or 1.0
+        for item in candidates.values():
+            text = f" {normalize_name((item['title'] or '') + ' ' + item['statement'])} "
+            coverage = (sum(1 for t in tokens if f" {t}" in text) / len(tokens)) if tokens else 0.0
+            score = 0.55 * (item["text_score"] / best) + 0.45 * coverage
+            if item["entity_id"] in mentioned:
+                score += 0.35
+            score *= 1 + 0.15 * min(item["supported_by"], 3)
+            if item["type"] in _DURABLE_TYPES:
+                score *= 1.1
+            item["score"] = round(score, 4)
+            del item["text_score"]
+        ranked = sorted((c for c in candidates.values() if c["supported_by"] >= min_supported),
+                        key=lambda c: (-c["score"], -c["id"]))
+        return ranked[:limit]
+
+    def get_claim(self, claim_id: int) -> dict[str, Any] | None:
+        """Una afirmación con todo lo que un agente necesita para valorarla."""
+        row = self.db.execute(
+            _CLAIM_SELECT + ", s0.url AS source_url, s0.external_id AS source_external_id, "
+            "s0.platform AS source_platform FROM claims c " + _CLAIM_JOINS + "WHERE c.id = ?",
+            (claim_id,)).fetchone()
+        if row is None:
+            return None
+        item = _claim(row)
+        item["implications"] = self.implications_for(claim_id)
+        item["relations"] = self.relations_for(claim_id)
+        return item
 
     def implications_for(self, claim_id: int) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute(
